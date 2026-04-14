@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.sensors import FrameTransformer
+from isaaclab.sensors import FrameTransformer, TiledCamera
 from isaaclab.utils.math import euler_xyz_from_quat
 
 if TYPE_CHECKING:
@@ -280,3 +280,23 @@ def object_all_frames(env: ManagerBasedEnv, asset_name: str) -> dict[str, torch.
             pass
 
     return frames_dict
+
+
+##
+# Camera Observations
+##
+
+
+def camera_rgb(env: ManagerBasedEnv, sensor_name: str) -> torch.Tensor:
+    """RGB image from a TiledCamera sensor.
+
+    Args:
+        env: The environment instance.
+        sensor_name: Scene key of the TiledCamera (e.g. ``"overhead_camera"``).
+
+    Returns:
+        Float tensor of shape (num_envs, H, W, 3) normalised to [0, 1].
+    """
+    camera: TiledCamera = env.scene[sensor_name]
+    rgb = camera.data.output["rgb"][..., :3]  # drop alpha channel if present
+    return rgb.float() / 255.0

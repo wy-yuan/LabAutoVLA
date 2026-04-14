@@ -18,10 +18,12 @@ from matterix_sm import PipetteLiquidCfg
 from matterix_sm.robot_action_spaces import FRANKA_IK_ACTION_SPACE
 
 import isaaclab.envs.mdp as isaaclab_mdp
+import isaaclab.sim as sim_utils
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import TiledCameraCfg
 from isaaclab.utils import configclass
 
 
@@ -178,8 +180,22 @@ class ObservationManagerCfg:
             self.enable_corruption = False
             self.concatenate_terms = False
 
+    @configclass
+    class CameraGroup(ObsGroup):
+        """Camera image observations for VLA training."""
+
+        overhead_rgb = ObsTerm(
+            func=mdp.camera_rgb,
+            params={"sensor_name": "overhead_camera"},
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = False
+
     articulations: ArticulationsGroup = ArticulationsGroup()
     rigid_objects: RigidObjectsGroup = RigidObjectsGroup()
+    camera: CameraGroup = CameraGroup()
 
 
 ##
@@ -209,7 +225,7 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
     objects = {
         # "pipette": PIPETTE_1ML_INST_CFG(pos=(0.6518, -0.275, 0.01)),
         # "pipette_rack": PIPETTE_RACK_CFG(pos=(0.65, -0.3, 0.0)),
-        "pipette": PIPETTE_1ML_INST_CFG(pos=(0.55, -0.3, 0.01)),
+        "pipette": PIPETTE_1ML_INST_CFG(pos=(0.55, -0.3, 0.05)),
         "pipette_rack": PIPETTE_RACK_CFG(pos=(0.55, -0.3, 0.0)),
         "source_beaker": BEAKER_SOURCE_CFG(pos=(0.6, 0.2, 0.05)),
         "target_beaker": BEAKER_TARGET_CFG(pos=(0.6, 0.0, 0.05)),
@@ -231,7 +247,31 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
         ),
     }
 
+    # ── Sensors (env-level, not attached to a specific asset) ─────────────
+    sensors = {
+        "overhead_camera": TiledCameraCfg(
+            prim_path="/World/envs/env_.*/OverheadCamera",
+            offset=TiledCameraCfg.OffsetCfg(
+                pos=(0.9, 0.0, 0.4),
+                rot=(0, -0.258819, 0, 0.9659258),
+                convention="world",
+            ),
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=12.0,
+                focus_distance=400.0,
+                horizontal_aperture=20.955,
+                clipping_range=(0.1, 20.0),
+            ),
+            width=224,
+            height=224,
+        ),
+    }
+
     gripper_joint_names = ["panda_finger_joint1", "panda_finger_joint2"]
+
+    # Re-render after resets so the camera sees the freshly-reset scene
+    rerender_on_reset = True
 
     observations = ObservationManagerCfg()
     events = EventCfg()
@@ -249,11 +289,11 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
             pipette="pipette",
             source="source_beaker",
             target="target_beaker",
-            aspirate_depth=0.05,
-            dispense_depth=0.05,
+            aspirate_depth=0.14,
+            dispense_depth=0.14,
             aspirate_duration=1.5,
             dispense_duration=1.5,
-            lift_height=0.08,
+            lift_height=0.18,
             action_space_info=FRANKA_IK_ACTION_SPACE,
         ),
     }

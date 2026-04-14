@@ -75,11 +75,11 @@ class PipetteLiquidCfg(CompositionalActionCfg):
     action_space_info: ActionSpaceInfo | None = None
 
     # Tunable motion parameters
-    aspirate_depth: float = 0.05      # m — how far to dip into source liquid
-    dispense_depth: float = 0.05      # m — how far to dip into target
+    aspirate_depth: float = 0.25      # m — how far to dip into source liquid
+    dispense_depth: float = 0.25      # m — how far to dip into target
     aspirate_duration: float = 1.5    # s — hold time to simulate aspiration
     dispense_duration: float = 1.5    # s — hold time to simulate dispensing
-    lift_height: float = 0.08         # m — clearance height after each dip
+    lift_height: float = 0.15         # m — clearance height after each dip
 
     def __post_init__(self):
         """Build the 9-step primitive action sequence after field initialisation."""
@@ -123,20 +123,20 @@ class PipetteLiquidCfg(CompositionalActionCfg):
             ),
 
             # ── Step 2: Move above source container ──────────────────────────
-            # MoveToFrameCfg(
-            #     object=self.source,
-            #     frame="liquid_approach",
-            #     agent_assets=self.agent_assets,
-            #     action_space_info=self.action_space_info,
-            # ),
+            MoveToFrameCfg(
+                object=self.source,
+                frame="liquid_approach",
+                agent_assets=self.agent_assets,
+                action_space_info=self.action_space_info,
+            ),
 
             # # ── Step 3: Lower tip into source liquid ─────────────────────────
-            # MoveRelativeCfg(
-            #     agent_assets=self.agent_assets,
-            #     position_offset=(0.0, 0.0, -self.aspirate_depth),
-            #     orientation_offset=None,
-            #     action_space_info=self.action_space_info,
-            # ),
+            MoveRelativeCfg(
+                agent_assets=self.agent_assets,
+                position_offset=(0.0, 0.0, -self.aspirate_depth),
+                orientation_offset=None,
+                action_space_info=self.action_space_info,
+            ),
 
             # # ── Step 4: Hold position — simulate aspiration ──────────────────
             # # Keeps the gripper closed (holds the pipette) for aspirate_duration.
@@ -147,28 +147,28 @@ class PipetteLiquidCfg(CompositionalActionCfg):
             # ),
 
             # # ── Step 5: Lift tip clear of source ─────────────────────────────
-            # MoveRelativeCfg(
-            #     agent_assets=self.agent_assets,
-            #     position_offset=(0.0, 0.0, self.lift_height),
-            #     orientation_offset=None,
-            #     action_space_info=self.action_space_info,
-            # ),
+            MoveRelativeCfg(
+                agent_assets=self.agent_assets,
+                position_offset=(0.0, 0.0, self.lift_height),
+                orientation_offset=None,
+                action_space_info=self.action_space_info,
+            ),
 
             # # ── Step 6: Move above target container ──────────────────────────
-            # MoveToFrameCfg(
-            #     object=self.target,
-            #     frame="liquid_approach",
-            #     agent_assets=self.agent_assets,
-            #     action_space_info=self.action_space_info,
-            # ),
+            MoveToFrameCfg(
+                object=self.target,
+                frame="liquid_approach",
+                agent_assets=self.agent_assets,
+                action_space_info=self.action_space_info,
+            ),
 
             # # ── Step 7: Lower tip into target ────────────────────────────────
-            # MoveRelativeCfg(
-            #     agent_assets=self.agent_assets,
-            #     position_offset=(0.0, 0.0, -self.dispense_depth),
-            #     orientation_offset=None,
-            #     action_space_info=self.action_space_info,
-            # ),
+            MoveRelativeCfg(
+                agent_assets=self.agent_assets,
+                position_offset=(0.0, 0.0, -self.dispense_depth),
+                orientation_offset=None,
+                action_space_info=self.action_space_info,
+            ),
 
             # # ── Step 8: Hold position — simulate dispensing ──────────────────
             # CloseGripperCfg(
@@ -178,10 +178,10 @@ class PipetteLiquidCfg(CompositionalActionCfg):
             # ),
 
             # # ── Step 9: Lift tip clear of target ─────────────────────────────
-            # MoveRelativeCfg(
-            #     agent_assets=self.agent_assets,
-            #     position_offset=(0.0, 0.0, self.lift_height),
-            #     orientation_offset=None,
-            #     action_space_info=self.action_space_info,
-            # ),
+            MoveRelativeCfg(
+                agent_assets=self.agent_assets,
+                position_offset=(0.0, 0.0, self.lift_height),
+                orientation_offset=None,
+                action_space_info=self.action_space_info,
+            ),
         ]

@@ -47,9 +47,9 @@ class PIPETTE_1ML_INST_CFG(MatterixRigidObjectCfg):
     """
 
     prim_path = default_rigid_prim_path
-    usd_path = f"{MATTERIX_ASSETS_DATA_DIR}/labware/pipette/Pipette_vertical.usda"
+    usd_path = f"{MATTERIX_ASSETS_DATA_DIR}/labware/pipette/Pipette_vertical.usda" 
 
-    scale = (0.1, 0.1, 0.1)  # TODO: adjust once visible — try 0.1 if too large
+    scale = (0.1, 0.1, 0.1)
     rot = (0.707, 0.0, 0.0, -0.707)  # -90° around Z-axis
     mass = 0.05  # kg (~50 g for a typical hand pipette)
     activate_contact_sensors = False
@@ -67,7 +67,7 @@ class PIPETTE_1ML_INST_CFG(MatterixRigidObjectCfg):
     frames = {
         # Frames for picking up the pipette from its rack
         "pre_grasp": OffsetCfg(pos=(0.0, 0.0, 0.3), rot=(0.707, 0.0, 0.0, 0.707)), # Top-down approach
-        "grasp": OffsetCfg(pos=(0.0, 0.0, 0.07), rot=(0.707, 0.0, 0.0, 0.707)),         # grip centre (body origin)
+        "grasp": OffsetCfg(pos=(0.0, 0.0, 0.08), rot=(0.707, 0.0, 0.0, 0.707)),         # grip centre (body origin)
         "post_grasp": OffsetCfg(pos=(0.0, 0.0, 0.3), rot=(0.707, 0.0, 0.0, 0.707)), # initial test - Fingers point forward: (0.5, 0.5, -0.5, 0.5)
         "tip_pre": (0.0, 0.0, -0.16),     # 2 cm above the tip
         "tip": (0.0, 0.0, -0.18),         # at the pipette tip
@@ -83,6 +83,6 @@ class PIPETTE_RACK_CFG(MatterixStaticObjectCfg):
     prim_path = default_static_prim_path
     usd_path = f"{MATTERIX_ASSETS_DATA_DIR}/labware/pipetteRack/PipetteHolder.usda"
 
-    scale = (0.1, 0.1, 0.1)  # USD uses metersPerUnit=0.1, scale down 10x
+    scale = (0.101, 0.101, 0.101)  # USD uses metersPerUnit=0.1, scale down 10x
     rot = (0.707, 0.0, 0.0, -0.707)  # -90° around Z-axis
     semantic_tags = [("class", "pipette_rack")]
