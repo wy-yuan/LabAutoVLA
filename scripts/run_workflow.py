@@ -64,6 +64,30 @@ parser.add_argument(
     default="overhead_camera",
     help="Scene key of the TiledCamera to snapshot.",
 )
+parser.add_argument(
+    "--save_video",
+    action="store_true",
+    default=False,
+    help="Save a video per episode from the snapshot camera (requires --enable_cameras).",
+)
+parser.add_argument(
+    "--video_fps",
+    type=int,
+    default=30,
+    help="Frames per second for the saved video.",
+)
+parser.add_argument(
+    "--video_episodes",
+    type=int,
+    default=1,
+    help="Number of episodes to record (starting from the first).",
+)
+parser.add_argument(
+    "--video_stride",
+    type=int,
+    default=1,
+    help="Record a frame every N env steps (1 = every step).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -79,6 +103,7 @@ import datetime as _dt
 import os
 
 import gymnasium as gym
+import imageio.v2 as imageio
 import torch
 from PIL import Image
 
@@ -117,6 +142,25 @@ def _make_snapshot_dir(root: str) -> str:
     out = os.path.join(root, ts)
     os.makedirs(out, exist_ok=True)
     return out
+
+
+def _grab_camera_frames(env, camera_key: str):
+    """Return a uint8 RGB numpy array of shape (num_envs, H, W, 3)."""
+    camera = env.scene[camera_key]
+    rgb = camera.data.output["rgb"][..., :3]
+    if rgb.dtype.is_floating_point:
+        rgb = (rgb.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+    return rgb.detach().cpu().numpy()
+
+
+def _open_episode_writers(out_dir: str, episode: int, num_envs: int, fps: int):
+    """Open one mp4 writer per parallel env for the given episode."""
+    os.makedirs(out_dir, exist_ok=True)
+    writers = []
+    for env_idx in range(num_envs):
+        path = os.path.join(out_dir, f"episode_{episode:03d}_env_{env_idx}.mp4")
+        writers.append(imageio.get_writer(path, fps=fps, codec="libx264", quality=8))
+    return writers
 
 
 def main():
@@ -162,14 +206,22 @@ def main():
 
     # Set up camera snapshot output directory (timestamped so iterations don't clash)
     snapshot_dir = None
-    if args_cli.save_snapshots:
+    video_dir = None
+    if args_cli.save_snapshots or args_cli.save_video:
         if args_cli.snapshot_camera not in env.scene.keys():
             raise KeyError(
                 f"Camera '{args_cli.snapshot_camera}' not found in scene. "
                 f"Available keys: {list(env.scene.keys())}"
             )
+    if args_cli.save_snapshots:
         snapshot_dir = _make_snapshot_dir(args_cli.snapshot_dir)
         print(f"[INFO] Saving camera snapshots every {args_cli.snapshot_interval} steps to: {snapshot_dir}")
+    if args_cli.save_video:
+        video_dir = _make_snapshot_dir(os.path.join(args_cli.snapshot_dir, "videos"))
+        print(
+            f"[INFO] Saving video for first {args_cli.video_episodes} episode(s) "
+            f"at {args_cli.video_fps} fps (stride={args_cli.video_stride}) to: {video_dir}"
+        )
 
     episode_count = 0
 
@@ -191,6 +243,20 @@ def main():
                     env, args_cli.snapshot_camera, snapshot_dir, episode_count, step_count
                 )
 
+            # Open video writers for this episode (if recording is active)
+            video_writers = None
+            record_this_episode = (
+                video_dir is not None and episode_count <= args_cli.video_episodes
+            )
+            if record_this_episode:
+                video_writers = _open_episode_writers(
+                    video_dir, episode_count, env.num_envs, args_cli.video_fps
+                )
+                # Record the post-reset frame as the first video frame
+                frames = _grab_camera_frames(env, args_cli.snapshot_camera)
+                for env_idx, writer in enumerate(video_writers):
+                    writer.append_data(frames[env_idx])
+
             # Run until workflow completes or fails
             while not (sm.action_sequence_success | sm.action_sequence_failure).all():
                 action = sm.step(obs).to(env.device)
@@ -207,7 +273,18 @@ def main():
                         env, args_cli.snapshot_camera, snapshot_dir, episode_count, step_count
                     )
 
-            # Episode finished
+                # Append a frame to the video writers
+                if record_this_episode and step_count % args_cli.video_stride == 0:
+                    frames = _grab_camera_frames(env, args_cli.snapshot_camera)
+                    for env_idx, writer in enumerate(video_writers):
+                        writer.append_data(frames[env_idx])
+
+            # Episode finished — close video writers
+            if video_writers is not None:
+                for writer in video_writers:
+                    writer.close()
+                print(f"[INFO] Saved episode {episode_count} video(s) to: {video_dir}")
+
             sm.print_status(step=step_count, episode=episode_count)
 
     env.close()

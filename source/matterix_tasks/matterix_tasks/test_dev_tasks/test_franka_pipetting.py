@@ -19,6 +19,7 @@ from matterix_sm.robot_action_spaces import FRANKA_IK_ACTION_SPACE
 
 import isaaclab.envs.mdp as isaaclab_mdp
 import isaaclab.sim as sim_utils
+from isaaclab.sim import RenderCfg, SimulationCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -218,7 +219,11 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
         A FluidCfg is pre-loaded inside the source beaker so that liquid
         dynamics are visible during the transfer.
     """
-
+    # sim: SimulationCfg = SimulationCfg(
+    #     # dt=1/60.0,
+    #     render=RenderCfg(rendering_mode="performance"),
+    # )
+    
     env_spacing = 6.0
 
     # ── Static objects ───────────────────────────────────────────────────────
