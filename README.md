@@ -12,9 +12,7 @@
 
 ## Simulation Demo
 
-<video src="./demo/episode_001_env_0.mp4" controls width="224"></video>
-
-> If the embedded video does not render on your Git host, open [demo/episode_001_env_0.mp4](./demo/episode_001_env_0.mp4) directly.
+<img src="./demo/episode_001_env_0.gif" width="224" alt="pipetting demo" />
 
 ## Modeling
 ### 1. Record demos with existing workflow:
