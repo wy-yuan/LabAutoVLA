@@ -39,36 +39,8 @@ Generate high-quality training datasets directly from simulation with automatic 
 
 #### Single Task (Pipetting, 1000 episodes):
 ```bash
-C:\isaacsim5.1\python -m data.generate_dataset generation.tasks=[pipetting] \
-  generation.num_episodes=1000 generation.num_envs=4
+C:\isaacsim5.1\python -m data.generate_dataset stages.collect_hdf5=true stages.convert_lerobot=true
 ```
-
-**Output:** `data/datasets/pipetting_v1/`
-- `data.parquet` — main dataset with observation, action, task language
-- `videos/observation.images.overhead.mp4` — trajectory videos (compressed)
-- `generation_metadata.json` — generation parameters and statistics
-
-#### Multi-Task (Balanced, 600 total episodes):
-```bash
-run_isaac_python.bat -m data.generate_dataset \
-  generation.tasks=[pipetting,beaker_pick,tip_eject] \
-  generation.num_episodes=600 \
-  generation.num_envs=4 \
-  generation.seed=42
-```
-
-**Output:** `data/datasets/multi_task_v1/` (merged dataset)
-- All tasks combined with `task_type` field for filtering
-- Balanced: ~200 episodes per task
-
-#### Multi-Task (Weighted, 400+200 episodes):
-```bash
-run_isaac_python.bat -m data.generate_dataset \
-  generation.tasks=[pipetting,beaker_pick] \
-  'generation.episodes_per_task={pipetting:400,beaker_pick:200}' \
-  generation.num_envs=4
-```
-
 
 **Parquet columns:**
 - `observation.state`: (D_state,) float32 — proprioceptive state (EE pos + quat + gripper)
@@ -79,25 +51,13 @@ run_isaac_python.bat -m data.generate_dataset \
 
 #### Training on Generated Data
 
-```bash
-# Single task
-run_isaac_python.bat scripts\train.py \
-  mode=bc model=smolvla task=pipetting \
-  dataset.root=data/datasets/pipetting_v1
-
-# Multi-task (trains on all tasks simultaneously)
-run_isaac_python.bat scripts\train.py \
-  mode=bc model=smolvla task=pipetting \
-  dataset.root=data/datasets/multi_task_v1
-```
-
 ---
 
 ### Alternative: Record Manual Demos
 
 1. Record demos with existing workflow:
    ```bash
-   run_isaac_python.bat scripts\run_workflow.py \
+   C:\isaacsim5.1\python scripts\run_workflow.py \
      --task LabAuto-Test-Pipetting-Franka-v1 \
      --workflow pipette_liquid --num_envs 1 --save_video --headless
    ```
