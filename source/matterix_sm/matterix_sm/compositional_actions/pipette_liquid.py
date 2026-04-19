@@ -96,6 +96,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
              OpenGripperCfg(
                 # target_value=0.1, # open gripper to 20% for pick-up
                 agent_assets=self.agent_assets,
+                duration=0.2,
                 action_space_info=self.action_space_info,
             ),
             _relaxed_move_to_frame(
@@ -113,6 +114,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
             ),
             CloseGripperCfg(
                 agent_assets=self.agent_assets,
+                duration=0.2,
                 action_space_info=self.action_space_info,
             ),
             _relaxed_move_to_frame(

@@ -277,6 +277,7 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
 
     # Re-render after resets so the camera sees the freshly-reset scene
     rerender_on_reset = True
+    num_rerenders_on_reset: int = 1   # or 0 if you don't need extra renders after reset
 
     observations = ObservationManagerCfg()
     events = EventCfg()

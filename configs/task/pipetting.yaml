@@ -1,0 +1,83 @@
+# Pipetting task (LabAuto-Test-Pipetting-Franka-v1).
+id: LabAuto-Test-Pipetting-Franka-v1
+prompt: "Pick up the pipette, aspirate from the source beaker, and dispense into the target beaker."
+
+# Declares how Matterix observations map to VLA inputs. Consumed by
+# vla.data.obs_adapter.ObsAdapterConfig. Add new cameras / proprio
+# channels here WITHOUT touching code.
+adapter:
+  image_keys:
+    overhead: camera/overhead_rgb
+  state_keys:
+    - articulations/robot__ee_world_pos     # (3,)
+    - articulations/robot__ee_world_quat    # (4,)
+    - articulations/robot__gripper_pos      # (2,)
+  image_size: [224, 224]
+
+# Language template configuration for synthetic data generation.
+# Used by data.generate_dataset to create diverse natural language instructions.
+language_generation:
+  # Template strings with parameter placeholders
+  templates:
+    # Basic task descriptions
+    - "Pick up the pipette, aspirate {volume}µL from {source}, and dispense into {target}."
+    - "Using the pipette, transfer {volume}µL from {source} to {target}."
+
+    # More varied phrasings
+    - "Pipette {volume}µL: aspirate from {source}, dispense into {target}"
+    - "Move {volume}µL of liquid from the {source} to {target} using the pipette"
+
+    # Procedure-focused
+    - "Perform pipetting operation: {volume}µL from {source} into {target}"
+    - "Aspirate {volume}µL at depth {depth_cm}cm from {source}, dispense into {target}"
+
+    # Short/concise versions
+    - "{volume}µL {source} → {target}"
+    - "Pipette {volume}µL from {source} to {target}"
+
+  # Parameter definitions for template substitution
+  parameters:
+    volume:
+      type: "categorical"
+      #values: [1, 5, 10, 20, 50, 100, 150, 200]  # µL
+      values: [100]  # µL
+
+    source:
+      type: "categorical"
+      values:
+        - "source beaker"        
+        # - "source tube"
+        # - "reagent container"
+        # - "source well"
+        # - "reagent tube"
+
+    target:
+      type: "categorical"
+      values:
+        - "target beaker"        
+        # - "target tube"
+        # - "destination well"
+        # - "reaction vessel"
+        # - "collection tube"
+
+    depth_cm:
+      type: "float"
+      range: [0.5, 3.0]  # centimeters into container
+
+# Workflow execution configuration
+workflow:
+  name: "pipette_liquid"
+
+  # Workflow parameters (can be static or randomized)
+  parameters:
+    aspirate_depth: 0.1              # meters
+    dispense_depth: 0.1              # meters
+    aspirate_duration: 1.5           # seconds
+    dispense_duration: 1.5           # seconds
+    lift_height: 0.15                # meters
+
+  # Which parameters to randomize during generation
+  randomize_params:
+    aspirate_depth: [0.05, 0.15]     # Sample range (meters)
+    dispense_depth: [0.05, 0.15]     # Sample range (meters)
+    lift_height: [0.1, 0.2]          # Sample range (meters)

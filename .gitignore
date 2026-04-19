@@ -1,4 +1,6 @@
 snapshots/
+archived_scripts/
+data/datasets/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,0 +1,95 @@
+# =============================================================================
+# LabAutoVLA — Synthetic Dataset Generation Configuration
+# =============================================================================
+# This config drives the synthetic data generation pipeline.
+# Supports single-task and multi-task dataset creation with language variations
+# and domain randomization.
+#
+# Usage:
+#   Single task:
+#     python -m data.generate_dataset generation.tasks=[pipetting] \
+#       generation.num_episodes=1000 generation.num_envs=4
+#
+#   Multi-task (balanced):
+#     python -m data.generate_dataset \
+#       generation.tasks=[pipetting,beaker_pick,tip_eject] \
+#       generation.num_episodes=1000 generation.num_envs=4
+#
+#   Multi-task (weighted):
+#     python -m data.generate_dataset \
+#       generation.tasks=[pipetting,beaker_pick] \
+#       generation.episodes_per_task={pipetting:600,beaker_pick:400}
+# =============================================================================
+
+defaults:
+  - _self_
+
+# Pipeline stage controls
+stages:
+  collect_hdf5: true                 # Collect raw demos into HDF5 files
+  convert_lerobot: true              # Convert collected HDF5 files to LeRobot v3.0
+
+# Generation parameters
+generation:
+  # Tasks to generate data for
+  tasks: ["LabAuto-Test-Pipetting-Franka-v1"]                # List of task IDs (e.g., ["pipetting"] or ["pipetting", "beaker_pick"])
+
+  # Episode collection
+  num_episodes: 2                  # Total episodes to collect across all tasks
+  num_envs: 1                         # Number of parallel environments
+
+  # Per-task episode counts (optional)
+  episodes_per_task: null             # If null, distribute num_episodes evenly
+                                      # If specified: {task_name: count, ...}
+                                      # Must sum to num_episodes
+
+  # Episode length
+  max_steps: 800                      # Max timesteps per episode (truncate/pad to this)
+
+  # Reproducibility
+  seed: 42                            # Random seed for reproducibility
+  device: "cuda:0"                    # Compute device
+
+  # Filtering
+  only_successful: true               # Only save episodes where workflow succeeds
+                                      # If false, save all episodes (with success flag)
+
+# Domain randomization settings
+domain_randomization:
+  object_pose:
+    enabled: true                     # Randomize object positions
+    position_std: 0.05               # Gaussian std dev for positions (meters)
+    rotation_std: 0.1                # Gaussian std dev for rotations (radians)
+
+  physics:
+    enabled: false                    # Randomize friction, damping, etc. (TODO)
+
+  visual:
+    enabled: false                    # Randomize lighting, colors, etc. (TODO)
+
+# Output settings
+output:
+  root: "data/datasets"               # Root output directory
+  dataset_name: null                  # Optional explicit dataset name override
+  hdf5_subdir: "hdf5"                 # Subdirectory under root for collected HDF5 files
+  overwrite_hdf5: false               # Replace existing HDF5 files if they already exist
+  overwrite_lerobot: false            # Replace existing LeRobot dataset output if it already exists
+  repo_id: null                       # Optional LeRobot repo_id override (defaults to local/<dataset_name>)
+  format: "lerobot"                   # Output format (only "lerobot" supported)
+  fps: 30                             # Frames per second (metadata)
+  video_codec: "libx264"              # Video codec (H.264)
+  use_videos: true                    # Save images as MP4 videos (vs raw frames)
+
+# Logging and progress
+logging:
+  level: "INFO"                       # Logging level (DEBUG, INFO, WARNING, ERROR)
+  progress_interval: 10               # Print progress every N episodes
+  suppress_workflow_output: true      # Hide verbose StateMachine status prints during generation
+  save_interval: 100                  # Save checkpoint every N episodes (TODO)
+
+# Advanced settings (rarely changed)
+advanced:
+  episode_timeout: 30                 # Max episode runtime in seconds
+  frame_skip: 1                       # Collect every Nth frame (default: 1 = all frames)
+  normalize_observations: true        # Normalize images/states to standard ranges
+  allow_partial_episodes: false       # Allow saving incomplete episodes if timeout reached
