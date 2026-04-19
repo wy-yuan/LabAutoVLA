@@ -165,11 +165,20 @@ def _open_episode_writers(out_dir: str, episode: int, num_envs: int, fps: int):
 
 def main():
     # Parse configuration
-    env_cfg = parse_env_cfg(
-        args_cli.task,
-        device=args_cli.device,
-        num_envs=args_cli.num_envs,
-        use_fabric=not args_cli.disable_fabric,
+    parse_cfg_kwargs = {
+        "device": args_cli.device,
+        "num_envs": args_cli.num_envs,
+    }
+    # Let particle-enabled env configs keep their own fabric setting. Forcing
+    # use_fabric=True breaks particle rendering/simulation in the pipetting task.
+    if args_cli.disable_fabric:
+        parse_cfg_kwargs["use_fabric"] = False
+
+    env_cfg = parse_env_cfg(args_cli.task, **parse_cfg_kwargs)
+    print(
+        "[INFO] Parsed env config: "
+        f"enable_particles={getattr(env_cfg, 'enable_particles', False)}, "
+        f"use_fabric={getattr(env_cfg.sim, 'use_fabric', 'unknown')}"
     )
 
     # Validate workflow exists

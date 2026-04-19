@@ -2,6 +2,10 @@
 - GPU-accelerated simulation environment using NVIDIA Isaac Sim and Isaac Lab framework for realistic lab automation tasks 
 - VLA fine-tuning framework (SmolVLA with behavior cloning) integrated with simulation assets
 
+## Simulation Demo
+
+<img src="./demo/episode_001_env_0.gif" width="224" alt="pipetting demo" />
+
 ## Install
 1. Install Isaacsim and Isaaclab
 ```bash
@@ -27,9 +31,6 @@ C:\isaacsim5.1\python -m pip install torch==2.7.0 torchvision==0.22.0 --index-ur
 ```bash
 $env:MATTERIX_PATH = "[your_project_path]\LabAutoVLA"
 ```
-## Simulation Demo
-
-<img src="./demo/episode_001_env_0.gif" width="224" alt="pipetting demo" />
 
 ## Modeling
 
@@ -57,9 +58,7 @@ C:\isaacsim5.1\python -m data.generate_dataset stages.collect_hdf5=true stages.c
 
 1. Record demos with existing workflow:
    ```bash
-   C:\isaacsim5.1\python scripts\run_workflow.py \
-     --task LabAuto-Test-Pipetting-Franka-v1 \
-     --workflow pipette_liquid --num_envs 1 --save_video --headless
+   C:\isaacsim5.1\python scripts\run_workflow.py --task LabAuto-Test-Pipetting-Franka-v1 --workflow pipette_liquid --num_envs 1 --enable_cameras --save_video --headless
    ```
 
 ---
