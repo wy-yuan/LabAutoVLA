@@ -1,0 +1,42 @@
+# =============================================================================
+# LabAutoVLA — requirements
+# =============================================================================
+# Core simulation deps (isaaclab) are assumed installed separately via the
+# Isaac Lab installer; we don't pin them here to avoid conflicts.
+#
+# Everything below is what the VLA training stack needs on top of the
+# existing Matterix editable installs.
+# =============================================================================
+
+# --- LeRobot (datasets + SmolVLA policy) ---
+# Pinning to a commit is recommended in production; using a version range here.
+lerobot>=0.1.0
+
+# --- HuggingFace stack (SmolVLA backbone is a HF model) ---
+accelerate>=0.30.0
+
+# --- Config management ---
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+
+# --- Dataset I/O ---
+pyarrow>=14.0.0          # LeRobotDataset parquet backend
+datasets>=2.18.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9    # video writing for eval rollouts
+
+# --- Image handling ---
+opencv-python>=4.8.0
+
+# --- Experiment tracking (optional but recommended) ---
+wandb>=0.16.0
+
+# --- Utilities ---
+rich>=13.7.0
+antlr4-python3-runtime==4.9.3
+multiprocess
+pandas
+dill>=0.3.0
+httpx
+xxhash
+av
