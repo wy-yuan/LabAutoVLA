@@ -152,10 +152,25 @@ class ParticleSystem:
         point_instancer = UsdGeom.PointInstancer.Get(self.stage, self.particle_point_instancer_path)
         physicsUtils.set_or_add_translate_op(point_instancer, translate=pos)
 
-    def reset(self):
-        """Reset particles to initial positions/velocities and restore look."""
+    def reset(self, pos: tuple[float, float, float] | None = None):
+        """Reset particles to initial positions/velocities and restore look.
+
+        Args:
+            pos: Optional new lower-corner world position for the particle block.
+                When provided, the particle cloud is translated so its layout
+                stays the same while its anchor follows the requested position.
+        """
         instancer = UsdGeom.PointInstancer.Define(self.stage, self.particle_point_instancer_path)
-        instancer.GetPositionsAttr().Set(Vt.Vec3fArray(self.positions))
+        positions = self.positions
+        if pos is not None:
+            delta = (
+                float(pos[0] - self.cfg.pos[0]),
+                float(pos[1] - self.cfg.pos[1]),
+                float(pos[2] - self.cfg.pos[2]),
+            )
+            positions = [(p[0] + delta[0], p[1] + delta[1], p[2] + delta[2]) for p in self.positions]
+
+        instancer.GetPositionsAttr().Set(Vt.Vec3fArray(positions))
         instancer.GetVelocitiesAttr().Set(Vt.Vec3fArray(self.velocities))
         self.set_emission(enable_emission=False, emission_intensity=0.0)
         self.set_color(self.cfg.color_rgb)

@@ -105,11 +105,27 @@ class Particles:
         targets = [self.particle_systems[i] for i in idxs]
         return idxs, targets
 
-    def reset(self, env_ids=None) -> None:
-        """Reset particles to their initial state for selected envs."""
+    def reset(self, env_ids=None, pos: tuple[float, float, float] | list[tuple[float, float, float]] | None = None) -> None:
+        """Reset particles to their initial state for selected envs.
+
+        Args:
+            env_ids: Selected environments.
+            pos: Optional lower-corner world position override. Pass a single
+                3-tuple to use the same anchor for all selected envs, or a list
+                of per-env 3-tuples matching the selected env order.
+        """
         _, targets = self._targets_from_env_ids(env_ids)
-        for sys in targets:
-            sys.reset()
+        if pos is None or (isinstance(pos, tuple) and len(pos) == 3):
+            for sys in targets:
+                sys.reset(pos=pos)
+            return
+
+        if len(pos) != len(targets):
+            raise ValueError(
+                f"Expected {len(targets)} particle positions, got {len(pos)}."
+            )
+        for sys, target_pos in zip(targets, pos):
+            sys.reset(pos=target_pos)
 
     def set_color(self, env_ids, color_rgb: tuple[float, float, float]) -> None:
         """Set display color on selected envs’ materials."""

@@ -6,6 +6,8 @@
 """Test development environment for pipetting: pick up a pipette and transfer liquid
 between a source beaker and a target beaker using a Franka robot."""
 
+import torch
+
 from matterix.envs import MatterixBaseEnvCfg, mdp
 from matterix.managers import EventManagerCfg
 from matterix.particle_systems import FluidCfg
@@ -26,6 +28,32 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import TiledCameraCfg
 from isaaclab.utils import configclass
+
+
+SOURCE_FLUID_CENTER_OFFSET = (0.0, 0.0, 0.01)
+"""Fluid cuboid center relative to the source beaker root pose."""
+
+
+def reset_source_fluid_to_beaker(env, env_ids=None):
+    """Re-anchor the source fluid inside the randomized source beaker."""
+    scene_keys = set(env.scene.keys())
+    if "source_fluid" not in env.particle_systems or "source_beaker" not in scene_keys:
+        return
+
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
+    elif not isinstance(env_ids, torch.Tensor):
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device)
+
+    fluid_cfg = env.cfg.particle_systems["source_fluid"]
+    volume = torch.tensor(fluid_cfg.volume, dtype=torch.float32, device=env.device)
+    center_offset = torch.tensor(SOURCE_FLUID_CENTER_OFFSET, dtype=torch.float32, device=env.device)
+
+    beaker_positions = env.scene["source_beaker"].data.root_pos_w[env_ids]
+    lower_positions = beaker_positions + center_offset - (volume / 2.0)
+    lower_positions_list = [tuple(pos.tolist()) for pos in lower_positions]
+
+    env.particle_systems["source_fluid"].reset(env_ids=env_ids, pos=lower_positions_list)
 
 
 ##
@@ -107,6 +135,11 @@ class EventCfg(EventManagerCfg):
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("target_beaker"),
         },
+    )
+
+    sync_source_fluid_to_beaker = EventTerm(
+        func=reset_source_fluid_to_beaker,
+        mode="reset",
     )
 
 
@@ -247,8 +280,8 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
     # pos is in world frame; volume (x, y, z) fills the beaker interior.
     particle_systems = {
         "source_fluid": FluidCfg(
-            pos=(0.6, 0.1, 0.12),          # slightly above beaker origin
-            volume=(0.04, 0.04, 0.06),      # ~96 mL block of fluid
+            pos=(0.6, 0.2, 0.01),          # centered inside the source beaker
+            volume=(0.02, 0.02, 0.03),      # ~96 mL block of fluid
         ),
     }
 
