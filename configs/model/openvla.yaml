@@ -1,0 +1,11 @@
+# OpenVLA stub — placeholder to demonstrate extension.
+# To enable:
+#   1. Create vla/models/openvla.py with @register_vla("openvla")
+#   2. Fill in the kwargs this __init__ expects.
+#   3. Run: python scripts/train.py model=openvla
+name: openvla
+
+kwargs:
+  pretrained_name_or_path: openvla/openvla-7b
+  device: cuda
+  # ... add model-specific args here

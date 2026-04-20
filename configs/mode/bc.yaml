@@ -1,0 +1,28 @@
+# Behavior Cloning training mode.
+name: bc
+
+device: cuda
+epochs: 50
+batch_size: 4
+num_workers: 4
+
+# Checkpointing / evaluation cadence
+ckpt_every: 5
+eval_every: 5
+
+# Online sim evaluation — set false to skip spinning up Isaac Lab.
+sim_eval: true
+eval:
+  n_episodes: 3
+  max_steps: 500
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+
+# Experiment tracking
+use_wandb: false
+wandb_project: labauto-vla
+run_name: null               # null -> wandb autogenerates

@@ -1,0 +1,14 @@
+# SmolVLA (LeRobot) wrapper config.
+# The `name` key selects the registered class in vla/models/registry.py.
+# Everything under `kwargs` is forwarded to the wrapper's __init__.
+name: smolvla
+
+kwargs:
+  pretrained_name_or_path: lerobot/smolvla_base
+  chunk_size: 50             # null -> use SmolVLA default
+  n_action_steps: 50
+  freeze_vision_encoder: true
+  train_expert_only: false
+  load_pretrained: true
+  load_vlm_weights: true
+  device: cuda

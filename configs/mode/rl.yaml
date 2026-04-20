@@ -1,0 +1,33 @@
+# RL fine-tune — scaffold only. Do NOT rely on this yet.
+# See vla/training/rl_finetune.py for the intended integration plan.
+name: rl
+
+device: cuda
+algo: ppo                    # {ppo, dppo, iql, awr}  (not implemented)
+bc_ckpt: null                # path to BC checkpoint to warm-start from
+
+# Rollout
+num_envs: 32
+rollout_steps: 128
+total_env_steps: 2_000_000
+
+# Optim
+optim:
+  lr: 3.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  grad_clip: 1.0
+
+# KL regulariser against the frozen BC policy. Strongly recommended —
+# prevents the VLA from drifting off the imitation prior.
+kl_to_bc: 0.05
+
+# Sim evaluation + video recording — same knobs as BC.
+sim_eval: true
+eval:
+  n_episodes: 5
+  max_steps: 500
+
+use_wandb: false
+wandb_project: labauto-vla
+run_name: null

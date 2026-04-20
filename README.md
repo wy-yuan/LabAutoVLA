@@ -22,7 +22,7 @@ C:\isaacsim5.1\python -m pip install -e .\source\*
 
 3. Install other requirements
 ```bash
-C:\isaacsim5.1\python -m pip install -r requirements.txt --no-deps # Avoid conflicts
+C:\isaacsim5.1\python -m pip install -r requirements.txt --upgrade-strategy only-if-needed # Avoid conflicts
 # Cuda torch should work after Isaaclab installation. If it fails, reinstall with: 
 C:\isaacsim5.1\python -m pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 ```
@@ -51,7 +51,9 @@ C:\isaacsim5.1\python -m data.generate_dataset stages.collect_hdf5=true stages.c
 - `task_type`: str — task ID (for multi-task datasets)
 
 #### Training on Generated Data
-
+```bash
+C:\isaacsim5.1\python scripts/train.py mode=bc model=smolvla task=pipetting mode.sim_eval=false mode.epochs=1 mode.batch_size=2 mode.num_workers=0
+```
 ---
 
 ### Record Manual Demos

@@ -40,3 +40,4 @@ dill>=0.3.0
 httpx
 xxhash
 av
+num2words
