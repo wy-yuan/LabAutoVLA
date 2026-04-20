@@ -62,6 +62,16 @@ class OutputLayout:
     hdf5_paths: dict[str, Path]
 
 
+@dataclass
+class TaskSpec:
+    """Resolved task alias/config pair used during one generation run."""
+
+    alias: str
+    config_path: Path
+    task_id: str
+    cfg: DictConfig
+
+
 # =============================================================================
 # Utilities
 # =============================================================================
@@ -140,40 +150,64 @@ def validate_stage_selection(cfg: DictConfig) -> None:
         raise ValueError("At least one stage must be enabled: collect_hdf5 or convert_lerobot.")
 
 
-def load_task_configs(cfg: DictConfig, tasks: list[str]) -> dict[str, DictConfig]:
-    """Load task configurations from Hydra config."""
-    task_configs = {}
+def resolve_task_specs(cfg: DictConfig, tasks: list[str]) -> dict[str, TaskSpec]:
+    """Resolve requested task aliases into task configs and canonical env IDs."""
+    configured_paths = cfg.generation.get("task_cfg_paths")
+    if not configured_paths:
+        raise ValueError("generation.task_cfg_paths must define at least one task config path.")
 
-    # Load the task config file directly so we get the task body itself
-    # instead of depending on Hydra composition semantics for grouped configs.
-    task_cfg_path = _REPO_ROOT / "configs" / "task" / "pipetting.yaml"
-    pipetting_cfg = OmegaConf.load(task_cfg_path)
+    task_specs: dict[str, TaskSpec] = {}
+    for task_alias in tasks:
+        if task_alias not in configured_paths:
+            available = ", ".join(sorted(str(name) for name in configured_paths.keys()))
+            raise KeyError(
+                f"Task '{task_alias}' is not defined in generation.task_cfg_paths. "
+                f"Available tasks: {available}"
+            )
 
-    # All tasks use the same config for now.
-    for task_id in tasks:
-        task_configs[task_id] = pipetting_cfg
+        config_path = Path(str(configured_paths[task_alias]))
+        if not config_path.is_absolute():
+            config_path = _REPO_ROOT / config_path
 
-    return task_configs
+        if not config_path.exists():
+            raise FileNotFoundError(f"Task config for '{task_alias}' was not found: {config_path}")
+
+        task_cfg = OmegaConf.load(config_path)
+        task_id = task_cfg.get("id")
+        if not task_id:
+            raise ValueError(f"Task config '{config_path}' is missing required 'id' field.")
+
+        task_specs[task_alias] = TaskSpec(
+            alias=task_alias,
+            config_path=config_path,
+            task_id=str(task_id),
+            cfg=task_cfg,
+        )
+
+    return task_specs
 
 
 def create_language_generators(
-    task_configs: dict[str, DictConfig], seed: int | None = None
+    task_specs: dict[str, TaskSpec], seed: int | None = None
 ) -> dict[str, TaskLanguageTemplate]:
     """Create language generators for each task."""
     generators = {}
 
-    for task_id, task_cfg in task_configs.items():
+    for task_alias, task_spec in task_specs.items():
+        task_cfg = task_spec.cfg
         if "language_generation" not in task_cfg:
-            log.warning("Task %s has no language_generation config. Using default prompt.", task_id)
+            log.warning(
+                "Task %s has no language_generation config. Using default prompt.", task_alias
+            )
             task_cfg_dict = {
-                "templates": [task_cfg.get("prompt", f"Perform {task_id} task")],
+                "templates": [task_cfg.get("prompt", f"Perform {task_alias} task")],
                 "parameters": {},
             }
         else:
             task_cfg_dict = OmegaConf.to_container(task_cfg.language_generation, resolve=True)
 
-        generators[task_id] = TaskLanguageTemplate(
-            task_name=task_id,
+        generators[task_alias] = TaskLanguageTemplate(
+            task_name=task_alias,
             config=task_cfg_dict,
             seed=seed,
         )
@@ -184,8 +218,8 @@ def create_language_generators(
 
 def create_task_runtimes(
     cfg: DictConfig,
-    task_ids: list[str],
-    task_configs: dict[str, DictConfig],
+    task_aliases: list[str],
+    task_specs: dict[str, TaskSpec],
 ) -> dict[str, dict[str, Any]]:
     """Create environments and workflow executors for each task."""
     ensure_sim_app()
@@ -196,8 +230,10 @@ def create_task_runtimes(
 
     task_runtimes: dict[str, dict[str, Any]] = {}
 
-    for task_id in task_ids:
-        log.info("Creating environment for task: %s", task_id)
+    for task_alias in task_aliases:
+        task_spec = task_specs[task_alias]
+        task_id = task_spec.task_id
+        log.info("Creating environment for task: %s -> %s", task_alias, task_id)
 
         env_cfg = parse_env_cfg(
             task_id,
@@ -207,7 +243,7 @@ def create_task_runtimes(
         env = gym.make(task_id, cfg=env_cfg).unwrapped
 
         preferred_workflow_name = None
-        task_cfg = task_configs.get(task_id)
+        task_cfg = task_spec.cfg
         if task_cfg is not None and "workflow" in task_cfg and "name" in task_cfg.workflow:
             preferred_workflow_name = str(task_cfg.workflow.name)
 
@@ -218,9 +254,10 @@ def create_task_runtimes(
             suppress_output=bool(cfg.logging.get("suppress_workflow_output", True)),
         )
 
-        task_runtimes[task_id] = {
+        task_runtimes[task_alias] = {
             "env": env,
             "workflow_executor": workflow_executor,
+            "task_id": task_id,
         }
 
         log.info("  num_envs: %s, device: %s", env.num_envs, cfg.generation.device)
@@ -363,8 +400,8 @@ def determine_episodes_per_task(cfg: DictConfig) -> dict[str, int]:
 
 def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, int]:
     """Collect raw episodes and write them to per-task HDF5 files."""
-    task_configs = load_task_configs(cfg, cfg.generation.tasks)
-    language_gens = create_language_generators(task_configs, seed=cfg.generation.seed)
+    task_specs = resolve_task_specs(cfg, cfg.generation.tasks)
+    language_gens = create_language_generators(task_specs, seed=cfg.generation.seed)
     task_runtimes: dict[str, dict[str, Any]] = {}
     hdf5_writers: dict[str, HDF5DatasetWriter] = {}
 
@@ -375,30 +412,31 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
     pbar = tqdm(total=cfg.generation.num_episodes, desc="Collecting HDF5 episodes")
 
     try:
-        task_runtimes = create_task_runtimes(cfg, cfg.generation.tasks, task_configs)
+        task_runtimes = create_task_runtimes(cfg, cfg.generation.tasks, task_specs)
         hdf5_writers = {
-            task_id: HDF5DatasetWriter(
-                layout.hdf5_paths[task_id],
+            task_alias: HDF5DatasetWriter(
+                layout.hdf5_paths[task_alias],
                 overwrite=bool(cfg.output.get("overwrite_hdf5", False)),
             )
-            for task_id in cfg.generation.tasks
+            for task_alias in cfg.generation.tasks
         }
 
         task_queue: list[str] = []
-        for task_id, count in episodes_per_task.items():
-            task_queue.extend([task_id] * count)
+        for task_alias, count in episodes_per_task.items():
+            task_queue.extend([task_alias] * count)
 
         task_idx = 0
         while sum(episodes_collected.values()) < cfg.generation.num_episodes:
-            task_id = task_queue[task_idx % len(task_queue)]
+            task_alias = task_queue[task_idx % len(task_queue)]
             task_idx += 1
 
-            runtime = task_runtimes[task_id]
+            runtime = task_runtimes[task_alias]
             env = runtime["env"]
             workflow_executor = runtime["workflow_executor"]
+            task_id = runtime["task_id"]
 
             domain_state = extract_domain_state(env, task_id)
-            task_prompt = language_gens[task_id].generate(**domain_state)
+            task_prompt = language_gens[task_alias].generate(**domain_state)
 
             try:
                 episode_data = execute_episode(
@@ -412,7 +450,7 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
                 if cfg.generation.only_successful and not episode_data["success"]:
                     continue
 
-                hdf5_writers[task_id].add_episode(
+                hdf5_writers[task_alias].add_episode(
                     observations=episode_data["observations"],
                     actions=episode_data["actions"],
                     task=episode_data["task_prompt"],
@@ -420,7 +458,7 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
                     success=episode_data["success"],
                 )
 
-                episodes_collected[task_id] += 1
+                episodes_collected[task_alias] += 1
                 pbar.update(1)
 
                 if sum(episodes_collected.values()) % cfg.logging.progress_interval == 0:
@@ -448,13 +486,17 @@ def write_generation_metadata(
     if not layout.lerobot_dir.exists():
         return
 
+    task_specs = resolve_task_specs(cfg, cfg.generation.tasks)
     metadata = {
         "dataset_name": layout.dataset_name,
-        "hdf5_paths": {task_id: str(path) for task_id, path in layout.hdf5_paths.items()},
+        "hdf5_paths": {task_alias: str(path) for task_alias, path in layout.hdf5_paths.items()},
         "lerobot_dir": str(layout.lerobot_dir),
         "episodes_collected": episodes_collected or {},
         "stages": OmegaConf.to_container(cfg.stages, resolve=True),
         "tasks": list(cfg.generation.tasks),
+        "resolved_task_ids": {
+            task_alias: task_specs[task_alias].task_id for task_alias in cfg.generation.tasks
+        },
         "fps": int(cfg.output.fps),
         "video_codec": str(cfg.output.video_codec),
         "video_crf": int(cfg.output.video_crf),
