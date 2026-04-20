@@ -54,11 +54,11 @@ C:\isaacsim5.1\python -m data.generate_dataset stages.collect_hdf5=true stages.c
 
 ---
 
-### Alternative: Record Manual Demos
+### Record Manual Demos
 
 1. Record demos with existing workflow:
    ```bash
-   C:\isaacsim5.1\python scripts\run_workflow.py --task LabAuto-Test-Pipetting-Franka-v1 --workflow pipette_liquid --num_envs 1 --enable_cameras --save_video --headless
+   C:\isaacsim5.1\python scripts\run_workflow.py --task LabAuto-Test-Pipetting-Franka-v1 --workflow pipette_liquid --num_envs 1 --enable_cameras --save_video --headless --livestream=2 # or --livestream=1
    ```
 
 ---
