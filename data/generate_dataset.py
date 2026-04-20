@@ -73,7 +73,7 @@ def ensure_sim_app():
     if simulation_app is None:
         from isaaclab.app import AppLauncher
 
-        _app_launcher = AppLauncher(enable_cameras=True)
+        _app_launcher = AppLauncher(headless=True, enable_cameras=True, livestream=2)
         simulation_app = _app_launcher.app
     return simulation_app
 
@@ -457,6 +457,7 @@ def write_generation_metadata(
         "tasks": list(cfg.generation.tasks),
         "fps": int(cfg.output.fps),
         "video_codec": str(cfg.output.video_codec),
+        "video_crf": int(cfg.output.video_crf),
         "use_videos": bool(cfg.output.use_videos),
     }
 
@@ -481,6 +482,7 @@ def convert_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> Path:
         repo_id=repo_id,
         use_videos=cfg.output.use_videos,
         vcodec=cfg.output.video_codec,
+        video_crf=int(cfg.output.video_crf),
         overwrite=bool(cfg.output.get("overwrite_lerobot", False)),
     )
 

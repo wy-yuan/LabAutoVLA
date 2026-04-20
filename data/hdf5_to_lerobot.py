@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -114,6 +115,45 @@ def _normalize_vcodec(vcodec: str) -> str:
     return normalized
 
 
+def _install_lerobot_video_encoding_patch(video_crf: int) -> None:
+    """Patch LeRobot's internal video worker to use a lower CRF."""
+    try:
+        import lerobot.datasets.lerobot_dataset as lerobot_dataset
+        from lerobot.datasets.video_utils import encode_video_frames
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Dataset conversion requires the `lerobot` package "
+            "(pip install lerobot). See requirements.txt."
+        ) from exc
+
+    def _encode_video_worker(
+        video_key: str,
+        episode_index: int,
+        root: Path,
+        fps: int,
+        vcodec: str = "h264",
+        encoder_threads: int | None = None,
+    ) -> Path:
+        temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
+        fpath = lerobot_dataset.DEFAULT_IMAGE_PATH.format(
+            image_key=video_key, episode_index=episode_index, frame_index=0
+        )
+        img_dir = (root / fpath).parent
+        encode_video_frames(
+            img_dir,
+            temp_path,
+            fps,
+            vcodec=vcodec,
+            crf=video_crf,
+            overwrite=True,
+            encoder_threads=encoder_threads,
+        )
+        shutil.rmtree(img_dir)
+        return temp_path
+
+    lerobot_dataset._encode_video_worker = _encode_video_worker
+
+
 def _finalize_dataset(dataset: Any) -> None:
     """Finalize a LeRobot dataset across API versions."""
     if hasattr(dataset, "consolidate"):
@@ -137,6 +177,7 @@ def _create_dataset(
     adapter_cfg: ObsAdapterConfig,
     use_videos: bool,
     vcodec: str,
+    video_crf: int,
 ):
     """Create the destination LeRobot dataset from the first demo."""
     try:
@@ -146,6 +187,8 @@ def _create_dataset(
             "Dataset conversion requires the `lerobot` package "
             "(pip install lerobot). See requirements.txt."
         ) from exc
+
+    _install_lerobot_video_encoding_patch(video_crf)
 
     sample_inputs = build_vla_inputs(
         first_demo.observations,
@@ -187,6 +230,7 @@ def convert(
     adapter_cfg: ObsAdapterConfig | None = None,
     use_videos: bool = True,
     vcodec: str = "libx264",
+    video_crf: int = 18,
     overwrite: bool = False,
 ) -> Path:
     """Convert one or more HDF5 recordings into a LeRobot dataset."""
@@ -231,6 +275,7 @@ def convert(
         adapter_cfg=adapter_cfg,
         use_videos=use_videos,
         vcodec=vcodec,
+        video_crf=video_crf,
     )
 
     for demo in demos:
@@ -273,6 +318,7 @@ def _cli() -> None:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--repo_id", default=None)
     parser.add_argument("--vcodec", default="libx264")
+    parser.add_argument("--video-crf", type=int, default=18)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -284,6 +330,7 @@ def _cli() -> None:
         fps=args.fps,
         repo_id=args.repo_id,
         vcodec=args.vcodec,
+        video_crf=args.video_crf,
         overwrite=args.overwrite,
     )
 
