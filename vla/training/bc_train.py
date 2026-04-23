@@ -27,8 +27,10 @@ Design notes
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -37,9 +39,6 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from vla.data.obs_adapter import ObsAdapterConfig
-from vla.models import build_vla
-from vla.utils.logging import Logger
-
 log = logging.getLogger(__name__)
 
 
@@ -171,6 +170,7 @@ def _ensure_local_episode_metadata(root: Path, fps: int) -> None:
 
 def _build_dataset(cfg: DictConfig):
     """Load a LeRobotDataset. If it doesn't exist, convert from HDF5."""
+    log.info("Preparing LeRobot dataset from root=%s", cfg.dataset.root)
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
     except ImportError as exc:  # pragma: no cover
@@ -239,13 +239,49 @@ def _build_evaluator(cfg: DictConfig, adapter_cfg: ObsAdapterConfig):
     import gymnasium as gym
     import matterix_tasks  # noqa: F401  — registers envs
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
-
     from vla.envs.vla_env_wrapper import VLAEnvWrapper
-    from vla.training.evaluator import RolloutEvaluator
 
     env_cfg = parse_env_cfg(cfg.task.id, device=cfg.mode.device, num_envs=1)
-    env = gym.make(cfg.task.id, cfg=env_cfg).unwrapped
+    spec = gym.spec(cfg.task.id)
+    log.info(
+        "Building evaluator env id=%s entry_point=%s kwargs=%s device=%s num_envs=%s",
+        cfg.task.id,
+        spec.entry_point,
+        sorted(spec.kwargs.keys()),
+        cfg.mode.device,
+        getattr(env_cfg.scene, "num_envs", None),
+    )
+
+    if not faulthandler.is_enabled():
+        faulthandler.enable(file=sys.stderr)
+    faulthandler.dump_traceback_later(
+        30,
+        repeat=True,
+        file=sys.stderr,
+        exit=False,
+    )
+    try:
+        log.info("Starting evaluator env construction with gym.make")
+        env = gym.make(cfg.task.id, cfg=env_cfg).unwrapped
+        log.info("Evaluator env constructed type=%s", type(env).__name__)
+    except Exception:
+        log.exception(
+            "Failed while constructing evaluator env id=%s entry_point=%s device=%s",
+            cfg.task.id,
+            spec.entry_point,
+            cfg.mode.device,
+        )
+        raise
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+    log.info("Evaluator env constructed successfully")
+
     env = VLAEnvWrapper(env, adapter_cfg=adapter_cfg, task_prompt=cfg.task.prompt)
+    print(f"[bc_train] VLAEnvWrapper created: {type(env).__name__}", flush=True)
+
+    log.info("Building evaluator: VLAEnvWrapper created !!!!")
+    from vla.training.evaluator import RolloutEvaluator
 
     evaluator = RolloutEvaluator(
         env=env,
@@ -254,6 +290,7 @@ def _build_evaluator(cfg: DictConfig, adapter_cfg: ObsAdapterConfig):
         video_dir=Path(cfg.output_dir) / "eval_videos",
         video_fps=cfg.dataset.fps,
     )
+    print("[bc_train] RolloutEvaluator created", flush=True)
 
     def _run(policy, step):
         return evaluator.run(policy, step=step)
@@ -268,8 +305,16 @@ def run_bc(cfg: DictConfig) -> None:
     log.info("BC config:\n%s", OmegaConf.to_yaml(cfg))
     device = torch.device(cfg.mode.device)
 
+    # Build evaluator first so simulator startup happens at trainer start,
+    # not later after dataset/model setup.
+    adapter_cfg = ObsAdapterConfig(**OmegaConf.to_container(cfg.task.adapter, resolve=True))
+    eval_fn = _build_evaluator(cfg, adapter_cfg)
+
     # -- Dataset -------------------------------------------------------
+    log.info("Building training dataset")
+    print("[bc_train] Building training dataset", flush=True)
     dataset = _build_dataset(cfg)
+    log.info("Dataset ready")
     loader = DataLoader(
         dataset,
         batch_size=cfg.mode.batch_size,
@@ -281,6 +326,7 @@ def run_bc(cfg: DictConfig) -> None:
 
     # -- Model ---------------------------------------------------------
     # Infer proprio state dim from a sample batch so we don't hardcode it.
+    log.info("Loading sample batch to infer model dimensions")
     sample = next(iter(loader))
     state_dim = int(sample["observation.state"].shape[-1])
     action_dim = int(sample["action"].shape[-1])
@@ -290,6 +336,15 @@ def run_bc(cfg: DictConfig) -> None:
         if k.startswith("observation.images.")
     ]
 
+    log.info(
+        "Building VLA model name=%s state_dim=%d action_dim=%d image_keys=%s",
+        cfg.model.name,
+        state_dim,
+        action_dim,
+        image_keys,
+    )
+    from vla.models import build_vla
+
     vla = build_vla(
         cfg.model.name,
         action_dim=action_dim,
@@ -298,9 +353,12 @@ def run_bc(cfg: DictConfig) -> None:
         **OmegaConf.to_container(cfg.model.kwargs, resolve=True),
     )
     vla.to(device)
+    log.info("Model ready on device=%s", device)
 
     # -- Optim + Logger ------------------------------------------------
     optim = _build_optimizer(vla, cfg)
+    from vla.utils.logging import Logger
+
     logger = Logger(
         log_dir=Path(cfg.output_dir) / "tb",
         use_wandb=cfg.mode.get("use_wandb", False),
@@ -309,42 +367,48 @@ def run_bc(cfg: DictConfig) -> None:
         config=OmegaConf.to_container(cfg, resolve=True),
     )
 
-    adapter_cfg = ObsAdapterConfig(**OmegaConf.to_container(cfg.task.adapter, resolve=True))
-    eval_fn = _build_evaluator(cfg, adapter_cfg)
-
     # -- Loop ----------------------------------------------------------
-    global_step = 0
-    for epoch in range(cfg.mode.epochs):
-        vla.train()
-        for batch in loader:
-            batch = vla.preprocess_batch(batch)
-            out = vla.compute_loss(batch)
-            loss = out.loss
-            if loss is None:
-                raise RuntimeError(f"{cfg.model.name}.compute_loss returned no loss")
+    try:
+        global_step = 0
+        for epoch in range(cfg.mode.epochs):
+            vla.train()
+            log.info("Starting training epoch %d !!!", epoch + 1)
+            for batch in loader:
+                batch = vla.preprocess_batch(batch)
+                log.info("Preprocess batch !!!")
+                out = vla.compute_loss(batch)
+                loss = out.loss
+                if loss is None:
+                    raise RuntimeError(f"{cfg.model.name}.compute_loss returned no loss")
+                log.info("loss computed !!!")
+                optim.zero_grad(set_to_none=True)
+                loss.backward()
+                if cfg.mode.optim.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(vla.parameters(), cfg.mode.optim.grad_clip)
+                optim.step()
 
-            optim.zero_grad(set_to_none=True)
-            loss.backward()
-            if cfg.mode.optim.grad_clip:
-                torch.nn.utils.clip_grad_norm_(vla.parameters(), cfg.mode.optim.grad_clip)
-            optim.step()
+                logger.scalar("train/loss", float(loss.detach()), global_step)
+                global_step += 1
 
-            logger.scalar("train/loss", float(loss.detach()), global_step)
-            global_step += 1
+            log.info("epoch %d done (step=%d, loss=%.4f)", epoch, global_step, float(loss.detach()))
 
-        log.info("epoch %d done (step=%d, loss=%.4f)", epoch, global_step, float(loss.detach()))
+            # -- Periodic checkpoint + eval ---------------------------
+            if (epoch + 1) % cfg.mode.ckpt_every == 0 or epoch + 1 == cfg.mode.epochs:
+                ckpt_dir = Path(cfg.output_dir) / f"ckpt_epoch{epoch + 1:04d}"
+                vla.save_pretrained(ckpt_dir)
+                log.info("Saved checkpoint to %s", ckpt_dir)
+                print("[bc_train] Saved checkpoint !!!", flush=True)
 
-        # -- Periodic checkpoint + eval ---------------------------
-        if (epoch + 1) % cfg.mode.ckpt_every == 0 or epoch + 1 == cfg.mode.epochs:
-            ckpt_dir = Path(cfg.output_dir) / f"ckpt_epoch{epoch + 1:04d}"
-            vla.save_pretrained(ckpt_dir)
-            log.info("Saved checkpoint to %s", ckpt_dir)
+            if eval_fn is not None and (epoch + 1) % cfg.mode.eval_every == 0:
+                print("[bc_train] Running evaluation !!!", flush=True)
+                metrics = eval_fn(vla, step=epoch + 1)
+                print("[bc_train] Evaluation complete !!!", flush=True)
+                for k, v in metrics.items():
+                    logger.scalar(f"eval/{k}", v, global_step)
+                log.info("eval@epoch%d: %s", epoch + 1, metrics)
+                print("[bc_train] eval@epoch%d: %s" % (epoch + 1, metrics), flush=True)
+    finally:
+        logger.close()
 
-        if eval_fn is not None and (epoch + 1) % cfg.mode.eval_every == 0:
-            metrics = eval_fn(vla, step=epoch + 1)
-            for k, v in metrics.items():
-                logger.scalar(f"eval/{k}", v, global_step)
-            log.info("eval@epoch%d: %s", epoch + 1, metrics)
-
-    logger.close()
     log.info("BC training complete.")
+    print("[bc_train] Training complete !!!", flush=True)

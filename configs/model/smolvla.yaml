@@ -11,4 +11,4 @@ kwargs:
   train_expert_only: false
   load_pretrained: true
   load_vlm_weights: true
-  device: cuda
+  device: "cuda:0" 

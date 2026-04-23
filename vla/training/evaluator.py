@@ -47,19 +47,26 @@ class RolloutEvaluator:
         policy.eval()
         successes: list[float] = []
         lengths: list[int] = []
-
+        print("[evaluator] starting running policy !!!", flush=True)
         for ep in range(self.n_episodes):
             policy.reset()
             obs, info = self.env.reset()
 
             frames: list[np.ndarray] = []
+            prev_frame: np.ndarray | None = None
             success = False
             t = 0
+            print(f"[evaluator] starting episode {ep}", flush=True)
             for t in range(self.max_steps):
                 frame = self.env.render()
                 if frame is not None:
+                    # makes a NumPy array whose memory is laid out 
+                    # continuously in normal row-major order
+                    frame = np.ascontiguousarray(frame)
                     frames.append(frame)
-
+                else:
+                    print("[evaluator] render returned None", flush=True)
+                # print(obs["task"], flush=True)
                 with torch.inference_mode():
                     action = policy.predict_action(
                         images=obs["images"], state=obs["state"], task=obs["task"]

@@ -1,7 +1,7 @@
 # Behavior Cloning training mode.
 name: bc
 
-device: cuda
+device: "cuda:0" 
 epochs: 50
 batch_size: 4
 num_workers: 4
@@ -13,7 +13,7 @@ eval_every: 5
 # Online sim evaluation — set false to skip spinning up Isaac Lab.
 sim_eval: true
 eval:
-  n_episodes: 3
+  n_episodes: 1
   max_steps: 500
 
 optim:

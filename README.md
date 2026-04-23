@@ -23,6 +23,7 @@ C:\isaacsim5.1\python -m pip install -e .\source\*
 3. Install other requirements
 ```bash
 C:\isaacsim5.1\python -m pip install -r requirements.txt --upgrade-strategy only-if-needed # Avoid conflicts
+C:\isaacsim5.1\python -m pip install numpy==1.26.0 --force-reinstall  # force NumPy back to the Isaac Sim compatible version
 # Cuda torch should work after Isaaclab installation. If it fails, reinstall with: 
 C:\isaacsim5.1\python -m pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 ```

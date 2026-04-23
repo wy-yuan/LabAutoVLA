@@ -107,16 +107,16 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
         self.cfg = cfg
 
         print("-------------------------------")
-        print("[INFO]: Initializing the environment...")
-        print("[INFO]: Number of environments ", self.cfg.scene.num_envs)
+        print("[INFO]: Initializing the environment...", flush=True)
+        print("[INFO]: Number of environments ", self.cfg.scene.num_envs, flush=True)
         self.setup_scene()
         self.setup_recorder()
 
         # initialize the base class to setup the scene.
         super().__init__(cfg=cfg)
 
-        print("[INFO]: Number of environments ", self.cfg.scene.num_envs)
-        print("-------------------------------")
+        print("[INFO]: Number of environments ", self.cfg.scene.num_envs, flush=True)
+        print("-------------------------------", flush=True)
         # store the render mode
         self.render_mode = render_mode
 
@@ -126,7 +126,7 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
         # -- set the framerate of the gym video recorder wrapper so that the playback speed of the produced video matches the simulation
         self.metadata["render_fps"] = 1 / self.step_dt
 
-        print("[INFO]: Completed setting up the environment...")
+        print("[INFO]: Completed setting up the environment...", flush=True)
 
         self.particle_systems: dict[str, Particles] = {}
 
@@ -134,6 +134,7 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
             self.particle_systems[particle_name] = Particles(particle_name, particle_cfg, self)
 
         self.spawn_reserve_particle_systems()
+        print("[INFO]: spawn_reserve_particle_systems() done", flush=True)
 
     """
     Properties.

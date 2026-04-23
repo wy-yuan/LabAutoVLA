@@ -1,0 +1,31 @@
+# =============================================================================
+# LabAutoVLA simulation-only evaluation config
+# -----------------------------------------------------------------------------
+# Run default pretrained SmolVLA evaluation:
+#   python scripts/evaluate.py
+#
+# Override rollout length or episode count:
+#   python scripts/evaluate.py eval.n_episodes=3 eval.max_steps=300
+# =============================================================================
+
+defaults:
+  - model: smolvla
+  - task: pipetting
+  - _self_
+
+device: "cuda:0"
+
+eval:
+  n_episodes: 1
+  max_steps: 500
+
+dataset:
+  fps: 30
+
+output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_eval
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

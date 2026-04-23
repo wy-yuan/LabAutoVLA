@@ -132,6 +132,9 @@ class SmolVLA(BaseVLA):
                 raise KeyError(f"SmolVLA expects image key '{k}' — got {list(images)}")
             observation[f"observation.images.{k}"] = images[k].to(self._device)
 
+        observation = self.preprocess_batch(observation)
+        observation = self._move_to_device(observation)
+
         # ``select_action`` streams one action per call out of the internal
         # chunk buffer; call ``reset()`` between episodes (see BaseVLA.reset).
         action = self.policy.select_action(observation)
