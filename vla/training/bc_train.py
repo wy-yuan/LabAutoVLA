@@ -41,6 +41,9 @@ from torch.utils.data import DataLoader
 from vla.data.obs_adapter import ObsAdapterConfig
 log = logging.getLogger(__name__)
 
+_app_launcher = None
+simulation_app = None
+
 
 # ---------------------------------------------------------------------
 # Dataset loading
@@ -225,7 +228,124 @@ def _build_optimizer(model: torch.nn.Module, cfg: DictConfig) -> torch.optim.Opt
 # ---------------------------------------------------------------------
 # Evaluation harness (Matterix-in-the-loop)
 # ---------------------------------------------------------------------
+def _launch_sim_app():
+    """Launch Isaac Sim on demand for BC evaluation."""
+    global _app_launcher, simulation_app
+    if simulation_app is not None:
+        return simulation_app
+
+    print("[bc_train] Launching Isaac Sim for evaluator...", flush=True)
+    from isaaclab.app import AppLauncher
+
+    _app_launcher = AppLauncher(headless=True, enable_cameras=True, livestream=2)
+    simulation_app = _app_launcher.app
+    print("[bc_train] Isaac Sim launcher returned control.", flush=True)
+    return simulation_app
+
+
+def _close_sim_app() -> None:
+    """Close Isaac Sim if BC evaluation launched it."""
+    global _app_launcher, simulation_app
+    if simulation_app is not None:
+        simulation_app.close()
+        simulation_app = None
+        _app_launcher = None
+
+
+class _LazyEvaluator:
+    """Build the simulator-backed evaluator only when first needed."""
+
+    def __init__(self, cfg: DictConfig, adapter_cfg: ObsAdapterConfig):
+        self.cfg = cfg
+        self.adapter_cfg = adapter_cfg
+        self.env = None
+        self.evaluator = None
+
+    def _ensure_built(self) -> None:
+        if self.evaluator is not None:
+            return
+
+        _launch_sim_app()
+
+        # Heavy imports live inside the factory so BC-only training on
+        # machines without Isaac Lab still works (just set sim_eval=false).
+        import gymnasium as gym
+        import matterix_tasks  # noqa: F401 - registers envs
+        from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+        from vla.envs.vla_env_wrapper import VLAEnvWrapper
+        from vla.training.evaluator import RolloutEvaluator
+
+        env_cfg = parse_env_cfg(self.cfg.task.id, device=self.cfg.mode.device, num_envs=1)
+        spec = gym.spec(self.cfg.task.id)
+        log.info(
+            "Building evaluator env id=%s entry_point=%s kwargs=%s device=%s num_envs=%s",
+            self.cfg.task.id,
+            spec.entry_point,
+            sorted(spec.kwargs.keys()),
+            self.cfg.mode.device,
+            getattr(env_cfg.scene, "num_envs", None),
+        )
+
+        if not faulthandler.is_enabled():
+            faulthandler.enable(file=sys.stderr)
+        faulthandler.dump_traceback_later(
+            30,
+            repeat=True,
+            file=sys.stderr,
+            exit=False,
+        )
+        try:
+            log.info("Starting evaluator env construction with gym.make")
+            env = gym.make(self.cfg.task.id, cfg=env_cfg).unwrapped
+            log.info("Evaluator env constructed type=%s", type(env).__name__)
+        except Exception:
+            log.exception(
+                "Failed while constructing evaluator env id=%s entry_point=%s device=%s",
+                self.cfg.task.id,
+                spec.entry_point,
+                self.cfg.mode.device,
+            )
+            raise
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+        self.env = VLAEnvWrapper(
+            env,
+            adapter_cfg=self.adapter_cfg,
+            task_prompt=self.cfg.task.prompt,
+        )
+        print(f"[bc_train] VLAEnvWrapper created: {type(self.env).__name__}", flush=True)
+
+        log.info("Building evaluator: VLAEnvWrapper created")
+        self.evaluator = RolloutEvaluator(
+            env=self.env,
+            n_episodes=self.cfg.mode.eval.n_episodes,
+            max_steps=self.cfg.mode.eval.max_steps,
+            video_dir=Path(self.cfg.output_dir) / "eval_videos",
+            video_fps=self.cfg.dataset.fps,
+        )
+        print("[bc_train] RolloutEvaluator created", flush=True)
+
+    def run(self, policy, step):
+        self._ensure_built()
+        return self.evaluator.run(policy, step=step)
+
+    def close(self) -> None:
+        try:
+            if self.env is not None:
+                self.env.close()
+                self.env = None
+        finally:
+            self.evaluator = None
+            _close_sim_app()
+
+
 def _build_evaluator(cfg: DictConfig, adapter_cfg: ObsAdapterConfig):
+    """Return a closeable lazy evaluator, or ``None`` when disabled."""
+    if not cfg.mode.get("sim_eval", True):
+        return None
+    return _LazyEvaluator(cfg, adapter_cfg)
+
     """Spin up the Matterix env + wrapper + evaluator, lazily.
 
     Returned callable is ``(policy, step) -> metrics``. Returns ``None``
@@ -305,10 +425,10 @@ def run_bc(cfg: DictConfig) -> None:
     log.info("BC config:\n%s", OmegaConf.to_yaml(cfg))
     device = torch.device(cfg.mode.device)
 
-    # Build evaluator first so simulator startup happens at trainer start,
-    # not later after dataset/model setup.
+    # Keep simulator startup lazy so Windows DataLoader workers are spawned
+    # before Isaac Sim exists in the parent process.
     adapter_cfg = ObsAdapterConfig(**OmegaConf.to_container(cfg.task.adapter, resolve=True))
-    eval_fn = _build_evaluator(cfg, adapter_cfg)
+    eval_runner = _build_evaluator(cfg, adapter_cfg)
 
     # -- Dataset -------------------------------------------------------
     log.info("Building training dataset")
@@ -375,12 +495,10 @@ def run_bc(cfg: DictConfig) -> None:
             log.info("Starting training epoch %d !!!", epoch + 1)
             for batch in loader:
                 batch = vla.preprocess_batch(batch)
-                log.info("Preprocess batch !!!")
                 out = vla.compute_loss(batch)
                 loss = out.loss
                 if loss is None:
                     raise RuntimeError(f"{cfg.model.name}.compute_loss returned no loss")
-                log.info("loss computed !!!")
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 if cfg.mode.optim.grad_clip:
@@ -399,15 +517,17 @@ def run_bc(cfg: DictConfig) -> None:
                 log.info("Saved checkpoint to %s", ckpt_dir)
                 print("[bc_train] Saved checkpoint !!!", flush=True)
 
-            if eval_fn is not None and (epoch + 1) % cfg.mode.eval_every == 0:
+            if eval_runner is not None and (epoch + 1) % cfg.mode.eval_every == 0:
                 print("[bc_train] Running evaluation !!!", flush=True)
-                metrics = eval_fn(vla, step=epoch + 1)
+                metrics = eval_runner.run(vla, step=epoch + 1)
                 print("[bc_train] Evaluation complete !!!", flush=True)
                 for k, v in metrics.items():
                     logger.scalar(f"eval/{k}", v, global_step)
                 log.info("eval@epoch%d: %s", epoch + 1, metrics)
                 print("[bc_train] eval@epoch%d: %s" % (epoch + 1, metrics), flush=True)
     finally:
+        if eval_runner is not None:
+            eval_runner.close()
         logger.close()
 
     log.info("BC training complete.")
