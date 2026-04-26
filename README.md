@@ -59,6 +59,7 @@ C:\isaacsim5.1\python scripts/train.py mode=bc model=smolvla task=pipetting mode
 #### Evaluation
 ```bash
 C:\isaacsim5.1\python scripts/evaluate.py 
+C:\isaacsim5.1\python scripts/offline_predict_test.py n_samples=10
 ```
 ---
 

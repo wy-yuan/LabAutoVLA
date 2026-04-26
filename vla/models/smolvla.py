@@ -90,6 +90,9 @@ class SmolVLA(BaseVLA):
 
         # -- Build policy -------------------------------------------------
         if load_pretrained:
+            _ckpt = Path(pretrained_name_or_path)
+            if _ckpt.suffix == ".safetensors":
+                pretrained_name_or_path = str(_ckpt.parent)
             self.policy = SmolVLAPolicy.from_pretrained(pretrained_name_or_path, config=self.cfg)
         else:
             self.policy = SmolVLAPolicy(self.cfg)

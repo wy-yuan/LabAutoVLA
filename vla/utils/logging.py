@@ -27,6 +27,7 @@ class Logger:
     ):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.wandb_url: str | None = None
 
         # -- Tensorboard (always on — it's free and local) ------------
         try:
@@ -48,8 +49,13 @@ class Logger:
                     dir=str(self.log_dir),
                     config=dict(config) if config else None,
                 )
+                if wandb.run is not None:
+                    self.wandb_url = wandb.run.url
             except ImportError:  # pragma: no cover
                 log.warning("wandb requested but not installed — skipping")
+            except Exception:
+                self.wandb = None
+                log.exception("wandb requested but failed to initialize; skipping")
 
     def scalar(self, key: str, value: float, step: int) -> None:
         if self.tb is not None:

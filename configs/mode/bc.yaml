@@ -5,6 +5,8 @@ device: "cuda:0"
 epochs: 100
 batch_size: 4
 num_workers: 4
+validation_fraction: 0.1
+split_seed: 42
 
 # Checkpointing / evaluation cadence
 ckpt_every: 5

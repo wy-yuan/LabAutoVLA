@@ -36,7 +36,7 @@ from typing import Any
 
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 from vla.data.obs_adapter import ObsAdapterConfig
 log = logging.getLogger(__name__)
@@ -223,6 +223,53 @@ def _build_optimizer(model: torch.nn.Module, cfg: DictConfig) -> torch.optim.Opt
         {"params": no_decay, "weight_decay": 0.0},
     ]
     return torch.optim.AdamW(groups, lr=cfg.mode.optim.lr, betas=tuple(cfg.mode.optim.betas))
+
+
+def _split_train_val_dataset(dataset, val_fraction: float, seed: int):
+    """Split one dataset into train/validation subsets."""
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f"mode.validation_fraction must be in (0, 1), got {val_fraction}")
+
+    dataset_size = len(dataset)
+    if dataset_size < 2:
+        raise ValueError("Need at least 2 dataset samples to create a train/validation split")
+
+    val_size = max(1, int(round(dataset_size * val_fraction)))
+    train_size = dataset_size - val_size
+    if train_size < 1:
+        raise ValueError(
+            f"Validation split leaves no training samples: dataset_size={dataset_size}, "
+            f"validation_fraction={val_fraction}"
+        )
+
+    generator = torch.Generator().manual_seed(seed)
+    return random_split(dataset, [train_size, val_size], generator=generator)
+
+
+def _batch_size(batch: dict[str, Any]) -> int:
+    for value in batch.values():
+        if isinstance(value, torch.Tensor):
+            return int(value.shape[0])
+    return 1
+
+
+@torch.no_grad()
+def _validate(vla: torch.nn.Module, loader: DataLoader) -> float:
+    """Return mean validation model loss over a held-out loader."""
+    vla.eval()
+    total_loss = 0.0
+    total_samples = 0
+    for batch in loader:
+        batch = vla.preprocess_batch(batch)
+        out = vla.compute_loss(batch)
+        if out.loss is None:
+            raise RuntimeError("compute_loss returned no validation loss")
+        n = _batch_size(batch)
+        total_loss += float(out.loss.detach()) * n
+        total_samples += n
+    if total_samples == 0:
+        raise RuntimeError("Validation loader produced no batches")
+    return total_loss / total_samples
 
 
 # ---------------------------------------------------------------------
@@ -434,20 +481,42 @@ def run_bc(cfg: DictConfig) -> None:
     log.info("Building training dataset")
     print("[bc_train] Building training dataset", flush=True)
     dataset = _build_dataset(cfg)
-    log.info("Dataset ready")
-    loader = DataLoader(
+    train_dataset, val_dataset = _split_train_val_dataset(
         dataset,
+        val_fraction=float(cfg.mode.get("validation_fraction", 0.1)),
+        seed=int(cfg.mode.get("split_seed", 42)),
+    )
+    log.info(
+        "Dataset ready: total=%d train=%d val=%d",
+        len(dataset),
+        len(train_dataset),
+        len(val_dataset),
+    )
+    print(
+        f"[bc_train] Dataset split: train={len(train_dataset)} val={len(val_dataset)}",
+        flush=True,
+    )
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=cfg.mode.batch_size,
         shuffle=True,
         num_workers=cfg.mode.num_workers,
         pin_memory=True,
         drop_last=True,
     )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.mode.batch_size,
+        shuffle=False,
+        num_workers=cfg.mode.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
 
     # -- Model ---------------------------------------------------------
     # Infer proprio state dim from a sample batch so we don't hardcode it.
-    log.info("Loading sample batch to infer model dimensions")
-    sample = next(iter(loader))
+    log.info("Loading sample to infer model dimensions")
+    sample = dataset[0]
     state_dim = int(sample["observation.state"].shape[-1])
     action_dim = int(sample["action"].shape[-1])
     image_keys = [
@@ -486,6 +555,13 @@ def run_bc(cfg: DictConfig) -> None:
         wandb_run_name=cfg.mode.get("run_name", None),
         config=OmegaConf.to_container(cfg, resolve=True),
     )
+    if logger.wandb_url:
+        log.info("Weights & Biases run: %s", logger.wandb_url)
+        print(f"[bc_train] W&B run: {logger.wandb_url}", flush=True)
+    else:
+        tb_dir = Path(cfg.output_dir) / "tb"
+        log.info("TensorBoard logs: %s", tb_dir)
+        print(f"[bc_train] TensorBoard logs: {tb_dir}", flush=True)
 
     # -- Loop ----------------------------------------------------------
     try:
@@ -493,7 +569,7 @@ def run_bc(cfg: DictConfig) -> None:
         for epoch in range(cfg.mode.epochs):
             vla.train()
             log.info("Starting training epoch %d !!!", epoch + 1)
-            for batch in loader:
+            for batch in train_loader:
                 batch = vla.preprocess_batch(batch)
                 out = vla.compute_loss(batch)
                 loss = out.loss
@@ -506,9 +582,25 @@ def run_bc(cfg: DictConfig) -> None:
                 optim.step()
 
                 logger.scalar("train/loss", float(loss.detach()), global_step)
+                if out.aux:
+                    for key, value in out.aux.items():
+                        if isinstance(value, torch.Tensor) and value.numel() == 1:
+                            logger.scalar(f"train/aux/{key}", float(value.detach()), global_step)
+                        elif isinstance(value, (int, float)):
+                            logger.scalar(f"train/aux/{key}", float(value), global_step)
                 global_step += 1
 
-            log.info("epoch %d done (step=%d, loss=%.4f)", epoch, global_step, float(loss.detach()))
+            val_loss = _validate(vla, val_loader)
+            logger.scalar("val/loss", val_loss, global_step)
+            vla.train()
+
+            log.info(
+                "epoch %d done (step=%d, train_loss=%.4f, val_loss=%.4f)",
+                epoch,
+                global_step,
+                float(loss.detach()),
+                val_loss,
+            )
 
             # -- Periodic checkpoint + eval ---------------------------
             if (epoch + 1) % cfg.mode.ckpt_every == 0 or epoch + 1 == cfg.mode.epochs:
