@@ -1,0 +1,42 @@
+# =============================================================================
+# Offline teacher-forced action prediction test config
+# -----------------------------------------------------------------------------
+# Run with the default trained checkpoint:
+#   python scripts/offline_predict_test.py
+#
+# Limit samples:
+#   python scripts/offline_predict_test.py n_samples=50
+#
+# Use a different dataset root:
+#   python scripts/offline_predict_test.py dataset.root=data/datasets/my_ds
+# =============================================================================
+
+defaults:
+  - model: smolvla
+  - _self_
+
+device: "cuda:0"
+
+dataset:
+  root: data/datasets/pipetting_ep100
+  repo_id: local/pipetting_ep100
+  fps: 30
+  action_chunk_size: 50
+
+# Must match bc_train split so val set is identical to training holdout
+validation_fraction: 0.1
+split_seed: 42
+
+# null = use all validation samples
+n_samples: 1
+
+# null = analyse all episodes in the sequence plot; set e.g. 5 to limit
+n_seq_episodes: 1
+
+output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_offline_test
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false
