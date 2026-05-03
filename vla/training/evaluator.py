@@ -59,6 +59,7 @@ class RolloutEvaluator:
             print(f"[evaluator] starting episode {ep}", flush=True)
             for t in range(self.max_steps):
                 frame = self.env.render()
+                print(f"[evaluator] self.env.render step {t}", flush=True)
                 if frame is not None:
                     # makes a NumPy array whose memory is laid out 
                     # continuously in normal row-major order
@@ -71,9 +72,18 @@ class RolloutEvaluator:
                     action = policy.predict_action(
                         images=obs["images"], state=obs["state"], task=obs["task"]
                     )
-
+                # print(
+                #     f"[evaluator] action predicted  "
+                #     f"pos={action[..., :3].tolist()}  "
+                #     f"has_nan={bool(torch.isnan(action).any())}  "
+                #     f"has_inf={bool(torch.isinf(action).any())}",
+                #     flush=True,
+                # )
+                # Ensure all PyTorch CUDA work finishes before Isaac Sim's
+                # render pass inside env.step (different internal streams).
+                # if action.is_cuda:
+                #     torch.cuda.synchronize(action.device)
                 obs, reward, terminated, truncated, info = self.env.step(action)
-
                 if bool(torch.as_tensor(terminated).any()):
                     # Matterix termination == workflow success in most tasks.
                     success = True

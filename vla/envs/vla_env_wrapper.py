@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from vla.data.obs_adapter import ObsAdapterConfig, build_vla_inputs
+from vla.models.smolvla import action_to_env_action
 
 
 class VLAEnvWrapper(gym.Wrapper):
@@ -50,6 +51,7 @@ class VLAEnvWrapper(gym.Wrapper):
 
     def step(self, action):
         # Matterix envs return (obs, reward, terminated, truncated, info).
+        action = action_to_env_action(action)
         obs, reward, terminated, truncated, info = self.env.step(action)
         return self._adapt(obs), reward, terminated, truncated, info
 

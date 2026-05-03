@@ -26,6 +26,154 @@ from .base_vla import BaseVLA, VLAOutput
 from .registry import register_vla
 
 
+# ---------------------------------------------------------------------------
+# Quaternion helpers — [w, x, y, z] convention, matching Isaac Lab / LeRobot.
+# Used for relative-action conversion when use_relative_actions=True.
+# State layout: [ee_pos(3), ee_quat(4), gripper(2)]
+# Action layouts:
+#   8D: [pos(3), quat(4), gripper_open(1)]
+#   9D: [pos(3), quat(4), gripper_pos(2)]
+# ---------------------------------------------------------------------------
+
+def _quat_inv(q: torch.Tensor) -> torch.Tensor:
+    """Conjugate (== inverse for unit quaternions), [..., 4] [w,x,y,z]."""
+    return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+
+def _quat_normalize(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Normalize quaternions and canonicalize sign for smoother targets."""
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
+    return torch.where(q[..., :1] < 0, -q, q)
+
+
+def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Hamilton product q1 * q2, [..., 4] [w,x,y,z]."""
+    w1, x1, y1, z1 = q1[..., 0:1], q1[..., 1:2], q1[..., 2:3], q1[..., 3:4]
+    w2, x2, y2, z2 = q2[..., 0:1], q2[..., 1:2], q2[..., 2:3], q2[..., 3:4]
+    return torch.cat([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dim=-1)
+
+
+def _same_hemisphere(q: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Flip ``q`` if needed so it represents rotation near ``reference``."""
+    dot = (q * reference).sum(dim=-1, keepdim=True)
+    return torch.where(dot < 0, -q, q)
+
+
+def _gripper_open_from_state(state: torch.Tensor) -> torch.Tensor:
+    """Convert two observed finger positions to a single [0, 1] opening."""
+    grip = state[..., -2:] if state.shape[-1] >= 2 else state[..., -1:]
+    if grip.shape[-1] == 1:
+        return grip.clamp(0.0, 1.0)
+    return grip.abs().clamp(0.0, 0.04).mean(dim=-1, keepdim=True) / 0.04
+
+
+def _state_to_action_pose(state: torch.Tensor) -> torch.Tensor:
+    """Return current EE pose in the 8D base-frame action layout.
+
+    State layout:
+      [ee_pos(3), ee_quat(4), gripper_pos(2)]
+
+    The robot base is fixed for the current tasks, so the stored EE world pose
+    is already in the action frame.
+    """
+    if state.shape[-1] != 9:
+        raise ValueError(
+            "State must be compact 9D [ee_pos(3), ee_quat(4), gripper_pos(2)], "
+            f"got shape {tuple(state.shape)}"
+        )
+    return torch.cat(
+        [state[..., :3], _quat_normalize(state[..., 3:7]), _gripper_open_from_state(state)],
+        dim=-1,
+    )
+
+
+def actions_to_relative(actions: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    """Convert absolute base-frame EE-pose actions to relative actions.
+
+    All chunk steps are expressed relative to the state at t0 (the current
+    observation), so the model learns offsets rather than absolute targets.
+
+    args:
+        actions: (B, T, 8/9) or (B, 8/9) — [pos(3), quat(4), gripper...]
+        state:   (B, 9)               — [pos(3), quat(4), gripper(2)]
+
+    returns: same shape as *actions*
+        [pos_delta(3), quat_rel(4), gripper_abs(...)]
+    """
+    squeeze = actions.ndim == 2
+    if squeeze:
+        actions = actions.unsqueeze(1)  # (B, 1, 8)
+
+    state_pose = _state_to_action_pose(state)
+    state_pos = state_pose[:, :3].unsqueeze(1)
+    state_quat = state_pose[:, 3:7].unsqueeze(1)
+    action_quat = _same_hemisphere(
+        _quat_normalize(actions[..., 3:7]),
+        state_quat.expand_as(actions[..., 3:7]),
+    )
+
+    rel_pos = actions[..., :3] - state_pos
+    # q_action = q_state * q_rel, so q_rel = q_state^{-1} * q_action.
+    rel_quat = _quat_normalize(
+        _quat_mul(_quat_inv(state_quat).expand_as(action_quat), action_quat)
+    )
+    gripper = actions[..., 7:]  # gripper is an absolute command/position
+
+    if actions.shape[-1] == 8:
+        gripper = gripper.clamp(0.0, 1.0)
+    result = torch.cat([rel_pos, rel_quat, gripper], dim=-1)
+    return result.squeeze(1) if squeeze else result
+
+
+def actions_to_absolute(actions: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    """Invert :func:`actions_to_relative` to recover base-frame actions.
+
+    args:
+        actions: (B, T, 8/9) or (B, 8/9) — [pos_delta(3), quat_rel(4), gripper...]
+        state:   (B, 9)               — [pos(3), quat(4), gripper(2)]
+
+    returns: same shape as *actions*, base-frame
+    """
+    squeeze = actions.ndim == 2
+    if squeeze:
+        actions = actions.unsqueeze(1)
+
+    state_pose = _state_to_action_pose(state)
+    state_pos = state_pose[:, :3].unsqueeze(1)
+    state_quat = state_pose[:, 3:7].unsqueeze(1)
+    rel_quat = _quat_normalize(actions[..., 3:7])
+
+    abs_pos = actions[..., :3] + state_pos
+    # q_action = q_state * q_rel.
+    abs_quat = _quat_normalize(_quat_mul(state_quat.expand_as(rel_quat), rel_quat))
+    gripper = actions[..., 7:]
+
+    if actions.shape[-1] == 8:
+        gripper = gripper.clamp(0.0, 1.0)
+    result = torch.cat([abs_pos, abs_quat, gripper], dim=-1)
+    return result.squeeze(1) if squeeze else result
+
+
+def action_to_env_action(action: torch.Tensor) -> torch.Tensor:
+    """Convert learned 8D base-frame action to the Matterix env command."""
+    if action.shape[-1] != 8:
+        return action
+    processed = action.clone()
+    processed[..., 3:7] = _quat_normalize(processed[..., 3:7])
+    gripper_open = processed[..., 7:8].clamp(0.0, 1.0)
+    processed[..., 7:8] = torch.where(
+        gripper_open >= 0.5,
+        torch.ones_like(gripper_open),
+        -torch.ones_like(gripper_open),
+    )
+    return processed
+
+
 @register_vla("smolvla")
 class SmolVLA(BaseVLA):
     """Thin adapter around ``lerobot.common.policies.smolvla.SmolVLAPolicy``."""
@@ -43,9 +191,16 @@ class SmolVLA(BaseVLA):
         train_expert_only: bool = False,
         load_pretrained: bool = True,
         load_vlm_weights: bool = False,
+        use_relative_actions: bool = False,
+        step0_loss_weight: float = 1.0,
         device: str | torch.device = "cuda",
     ):
         super().__init__(action_dim=action_dim, state_dim=state_dim, image_keys=image_keys)
+        self.use_relative_actions = use_relative_actions
+        self.step0_loss_weight = step0_loss_weight
+        # Tracks which step in the current action chunk we are (for inference).
+        self._rel_base_state: torch.Tensor | None = None
+        self._rel_step_in_chunk: int = 0
 
         # Defer LeRobot import so the package is optional at collection /
         # linting time and so import errors surface with useful context.
@@ -106,6 +261,8 @@ class SmolVLA(BaseVLA):
     def compute_loss(self, batch: Mapping[str, Any]) -> VLAOutput:
         """Delegate to the underlying policy's forward-with-loss path."""
         batch = self._move_to_device(batch)
+        if self.use_relative_actions:
+            batch = self._batch_to_relative(batch)
         # LeRobot policies return either a dict (preferred) or a tuple
         # (loss, info). We normalise.
         result = self.policy.forward(batch)
@@ -116,6 +273,22 @@ class SmolVLA(BaseVLA):
             info = {k: v for k, v in result.items() if k != "loss"}
         else:
             loss, info = result, {}
+
+        # Extra weight on step-0: second forward pass with only step-0 unmasked.
+        # Adds (step0_loss_weight - 1) * L_step0 so the gradient from step-0
+        # is amplified relative to later chunk steps.
+        if self.step0_loss_weight != 1.0 and loss is not None:
+            step0_batch = self._make_step0_only_batch(batch)
+            r0 = self.policy.forward(step0_batch)
+            if isinstance(r0, tuple):
+                loss0 = r0[0]
+            elif isinstance(r0, dict):
+                loss0 = r0.get("loss")
+            else:
+                loss0 = r0
+            if loss0 is not None:
+                loss = loss + (self.step0_loss_weight - 1.0) * loss0
+
         return VLAOutput(actions=None, loss=loss, aux=info)
 
     @torch.inference_mode()
@@ -126,8 +299,17 @@ class SmolVLA(BaseVLA):
         task: Sequence[str],
     ) -> torch.Tensor:
         """Rollout helper — returns a single-step action ``(B, A)``."""
+        state_dev = state.to(self._device)
+
+        if self.use_relative_actions:
+            n_steps = getattr(self.cfg, "n_action_steps", 1) or 1
+            if self._rel_step_in_chunk == 0:
+                # Capture state at the start of each planning chunk so all
+                # actions in the chunk are converted relative to the same origin.
+                self._rel_base_state = state_dev.clone()
+
         observation: dict[str, Any] = {
-            "observation.state": state.to(self._device),
+            "observation.state": state_dev,
             "task": list(task),
         }
         for k in self.image_keys:
@@ -141,6 +323,12 @@ class SmolVLA(BaseVLA):
         # ``select_action`` streams one action per call out of the internal
         # chunk buffer; call ``reset()`` between episodes (see BaseVLA.reset).
         action = self.policy.select_action(observation)
+
+        if self.use_relative_actions and self._rel_base_state is not None:
+            action = actions_to_absolute(action, self._rel_base_state)
+            n_steps = getattr(self.cfg, "n_action_steps", 1) or 1
+            self._rel_step_in_chunk = (self._rel_step_in_chunk + 1) % n_steps
+
         return action  # (B, action_dim)
 
     # ------------------------------------------------------------------
@@ -150,6 +338,80 @@ class SmolVLA(BaseVLA):
         """Clear the internal action-chunk queue between episodes."""
         if hasattr(self.policy, "reset"):
             self.policy.reset()
+        self._rel_base_state = None
+        self._rel_step_in_chunk = 0
+
+    # ------------------------------------------------------------------
+    # Relative-action helpers
+    # ------------------------------------------------------------------
+    def _make_step0_only_batch(self, batch: dict) -> dict:
+        """Return a copy of batch where only step-0 is unmasked in the action chunk."""
+        step0 = dict(batch)
+        action = batch.get("action")
+        if action is None or action.ndim < 3:
+            return step0
+        B, T = action.shape[:2]
+        # All steps padded except step-0
+        pad = torch.ones(B, T, dtype=torch.bool, device=action.device)
+        pad[:, 0] = False
+        step0["actions_id_pad"] = pad
+        if "action_is_pad" in step0:
+            step0["action_is_pad"] = pad
+        return step0
+
+    def _batch_to_relative(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Convert the ``action`` field of a training batch to relative actions."""
+        processed = dict(batch)
+        state = batch.get("observation.state")
+        action = batch.get("action")
+        if state is None or action is None:
+            return processed
+        processed["action"] = actions_to_relative(action, state)
+        return processed
+
+    def update_action_normalizer_stats(
+        self, mean: torch.Tensor, std: torch.Tensor
+    ) -> None:
+        """Inject relative-action stats into the policy's normalizer buffers.
+
+        Called by bc_train when use_relative_actions=True so the policy's
+        internal normalization matches the relative action distribution.
+        """
+        try:
+            from lerobot.utils.constants import ACTION
+        except ImportError:
+            return
+
+        dev = self._device
+        mean_d = mean.to(dev)
+        std_d = std.to(dev)
+
+        # Update the config record so the stats persist with the checkpoint.
+        if hasattr(self.policy, "config") and self.policy.config is not None:
+            ds = getattr(self.policy.config, "dataset_stats", None) or {}
+            if not isinstance(ds, dict):
+                ds = {}
+            ds[ACTION] = {"mean": mean_d, "std": std_d}
+            try:
+                self.policy.config.dataset_stats = ds
+            except Exception:
+                pass
+
+        # Try to patch the normalizer module buffers directly.
+        # LeRobot stores stats as named buffers; walk candidate modules.
+        for attr in ("normalize_targets", "unnormalize_outputs"):
+            m = getattr(self.policy, attr, None)
+            if m is None:
+                continue
+            for _, submod in m.named_modules():
+                buffers = dict(submod.named_buffers(recurse=False))
+                for buf_name, buf in buffers.items():
+                    if buf is None:
+                        continue
+                    if "mean" in buf_name and buf.shape == mean_d.shape:
+                        submod._buffers[buf_name] = mean_d.clone()
+                    elif "std" in buf_name and buf.shape == std_d.shape:
+                        submod._buffers[buf_name] = std_d.clone()
 
     # ------------------------------------------------------------------
     # Persistence (prefer HF-native IO so we get safetensors shards)

@@ -2,8 +2,8 @@
 name: bc
 
 device: "cuda:0" 
-epochs: 100
-batch_size: 4
+epochs: 50
+batch_size: 12
 num_workers: 4
 validation_fraction: 0.1
 split_seed: 42
@@ -13,16 +13,20 @@ ckpt_every: 5
 eval_every: 5
 
 # Online sim evaluation — set false to skip spinning up Isaac Lab.
-sim_eval: true
+sim_eval: false
 eval:
   n_episodes: 1
   max_steps: 500
+  use_async_envs: false
 
 optim:
   lr: 1.0e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
   grad_clip: 1.0
+
+scheduler: cosine
+scheduler_warmup_steps: 1000
 
 # Experiment tracking
 use_wandb: false

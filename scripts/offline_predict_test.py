@@ -10,7 +10,7 @@ Loads a trained VLA checkpoint and produces two diagnostic plots:
 1. offline_predict_test.png  — per-chunk-horizon analysis averaged over the
    validation split (same 10 % holdout as bc_train).
 
-2. sequence_loss.png — per-timestep flow loss and step-0 L2 error plotted in
+2. sequence_loss.png — per-anchor action-chunk flow loss and step-0 L2 error plotted in
    temporal order over complete episodes from the FULL dataset (not the val
    split), so you see the 300-step task sequence as it unfolds.
 
@@ -123,6 +123,129 @@ def _load_model(cfg: DictConfig, action_dim: int, state_dim: int, image_keys: li
 
 
 # ---------------------------------------------------------------------------
+# Action-space helpers
+# ---------------------------------------------------------------------------
+
+def _use_relative_actions(cfg: DictConfig) -> bool:
+    kwargs = OmegaConf.to_container(cfg.model.get("kwargs", {}), resolve=True)
+    return bool((kwargs or {}).get("use_relative_actions", False))
+
+
+def _validate_action_contract(action_dim: int, state_dim: int) -> None:
+    """Fail early if this script is pointed at an old dataset/checkpoint pair."""
+    if action_dim not in (8, 9):
+        raise ValueError(
+            "offline_predict_test expects an 8D or 9D pose action "
+            f"[ee_pos(3), ee_quat(4), gripper...], got action_dim={action_dim}. "
+            "Use a compatible dataset/checkpoint pair before running this test."
+        )
+    if state_dim != 9:
+        raise ValueError(
+            "offline_predict_test expects compact 9D observation.state "
+            "[ee_pos(3), ee_quat(4), gripper_pos(2)], "
+            f"got state_dim={state_dim}."
+        )
+
+
+def _state_mode_label(state_dim: int) -> str:
+    if state_dim == 9:
+        return "9D state [ee_pos(3), ee_quat(4), gripper_pos(2)]"
+    return f"{state_dim}D state"
+
+
+def _action_mode_label(action_dim: int) -> str:
+    if action_dim == 8:
+        return "8D base-frame [pos(3), quat(4), gripper_open(1)]"
+    if action_dim == 9:
+        return "9D pose-frame [pos(3), quat(4), gripper_pos(2)]"
+    return f"{action_dim}D action"
+
+
+def _action_dim_labels(action_dim: int) -> list[str]:
+    if action_dim == 8:
+        return ["x", "y", "z", "qw", "qx", "qy", "qz", "grip"]
+    if action_dim == 9:
+        return ["x", "y", "z", "qw", "qx", "qy", "qz", "grip_l", "grip_r"]
+    return [f"d{d}" for d in range(action_dim)]
+
+
+def _normalize_quat_np(q: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    return q / np.maximum(np.linalg.norm(q, axis=-1, keepdims=True), eps)
+
+
+def _align_action_for_error(pred: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return copies of pred/GT with equivalent quaternion signs aligned.
+
+    Supported learned/offline action spaces:
+      8D: [ee_pos_b(3), ee_quat_b(4), gripper_open(1)]
+      9D: [ee_pos(3), ee_quat(4), gripper_pos(2)]
+
+    The 8D gripper scalar is a normalized opening and is clipped to [0, 1].
+    The 9D gripper channels are raw finger positions and may be signed, so they
+    are left in their learned units.
+    """
+    pred_aligned = np.array(pred, dtype=np.float32, copy=True)
+    gt_aligned = np.array(gt, dtype=np.float32, copy=True)
+    if pred_aligned.shape[-1] != gt_aligned.shape[-1]:
+        return pred_aligned, gt_aligned
+    if pred_aligned.shape[-1] not in (8, 9):
+        return pred_aligned, gt_aligned
+
+    pred_q = _normalize_quat_np(pred_aligned[..., 3:7])
+    gt_q = _normalize_quat_np(gt_aligned[..., 3:7])
+    same_rotation = np.sum(pred_q * gt_q, axis=-1, keepdims=True) >= 0.0
+    pred_aligned[..., 3:7] = np.where(same_rotation, pred_q, -pred_q)
+    gt_aligned[..., 3:7] = gt_q
+    if pred_aligned.shape[-1] == 8:
+        pred_aligned[..., 7:8] = np.clip(pred_aligned[..., 7:8], 0.0, 1.0)
+        gt_aligned[..., 7:8] = np.clip(gt_aligned[..., 7:8], 0.0, 1.0)
+    return pred_aligned, gt_aligned
+
+
+def _action_errors(pred: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Quaternion-aware L2/MSE/squared-dimension errors in learned action space."""
+    pred_aligned, gt_aligned = _align_action_for_error(pred, gt)
+    sq = (pred_aligned - gt_aligned) ** 2
+    return np.linalg.norm(pred_aligned - gt_aligned, axis=-1), np.mean(sq, axis=-1), sq
+
+
+def _valid_action_steps(batch: dict, length: int) -> np.ndarray:
+    """Return a boolean mask for non-padded action targets in a chunk."""
+    for key in ("action_is_pad", "actions_id_pad"):
+        if key not in batch:
+            continue
+
+        pad = batch[key]
+        if isinstance(pad, torch.Tensor):
+            pad_np = pad.detach().cpu().numpy()
+        else:
+            pad_np = np.asarray(pad)
+
+        if pad_np.ndim == 0:
+            pad_np = np.repeat(bool(pad_np), length)
+        elif pad_np.ndim >= 2:
+            pad_np = pad_np[0]
+
+        pad_np = np.asarray(pad_np, dtype=bool).reshape(-1)
+        valid = ~pad_np[:length]
+        if valid.shape[0] < length:
+            valid = np.pad(valid, (0, length - valid.shape[0]), constant_values=False)
+        return valid
+
+    return np.ones(length, dtype=bool)
+
+
+def _masked_average(total: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Divide totals by counts, leaving missing horizons as NaN."""
+    return np.divide(
+        total,
+        counts,
+        out=np.full_like(total, np.nan, dtype=np.float64),
+        where=counts > 0,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Prediction helpers
 # ---------------------------------------------------------------------------
 
@@ -136,6 +259,10 @@ def _predict_action_chunk(vla: Any, batch: dict, chunk_size: int) -> np.ndarray:
 
     Patches n_action_steps to chunk_size so a single inference call fills
     the action buffer with all chunk_size steps, then drains it.
+
+    For use_relative_actions=True, SmolVLA.predict_action converts the streamed
+    relative chunk back to absolute base-frame actions using the t0 state.
+    That is the correct offline comparison target for the dataset action.
 
     Returns np.ndarray of shape (chunk_size, action_dim).
     """
@@ -183,8 +310,11 @@ def _predict_action_chunk(vla: Any, batch: dict, chunk_size: int) -> np.ndarray:
     return np.stack(predicted, axis=0)  # (chunk_size, A)
 
 
-def _step0_l2(vla: Any, batch: dict) -> float:
-    """Single forward pass -> L2 error of the first predicted action vs GT."""
+def _predict_step0(vla: Any, batch: dict) -> np.ndarray:
+    """Single forward pass -> predicted learned action at step 0, shape (action_dim,).
+
+    The returned action is not converted to the env binary gripper command.
+    """
     vla.reset()
     image_keys = _image_keys_from_batch(batch)
     images = {}
@@ -204,10 +334,19 @@ def _step0_l2(vla: Any, batch: dict) -> float:
 
     with torch.inference_mode():
         pred = vla.predict_action(images, state, task)  # (1, A)
+    return pred.squeeze(0).cpu().float().numpy()
 
+
+def _extract_gt_step0(batch: dict) -> np.ndarray:
+    """Extract raw GT action at step 0 from a dataset batch, shape (action_dim,).
+
+    Must be called BEFORE preprocess_batch, which may normalize action tensors
+    in-place (when dev_batch shares storage with batch on the same device).
+    """
     gt = batch["action"]
-    gt = gt[:, 0, :] if gt.ndim == 3 else gt   # (1, A)
-    return float(torch.norm(pred.cpu().float() - gt.cpu().float()).item())
+    gt = gt[:, 0, :] if gt.ndim == 3 else gt  # (1, A)
+    return gt.squeeze(0).cpu().float().clone().numpy()
+
 
 
 # ---------------------------------------------------------------------------
@@ -220,13 +359,16 @@ def _run_sequence_analysis(
     cfg: DictConfig,
     n_episodes: int | None,
     log: logging.Logger,
-) -> list[tuple[int, int, float, float]]:
+) -> tuple[list[tuple[int, int, float, float]], np.ndarray, np.ndarray]:
     """Iterate complete episodes in temporal order and compute per-frame errors.
 
     LeRobot datasets are stored episode-by-episode in index order, so we
     simply iterate the full dataset and stop once we've covered n_episodes.
 
-    Returns list of (episode_idx, frame_idx, flow_loss, step0_l2).
+    Returns:
+        records        — list of (episode_idx, frame_idx, flow_loss, step0_l2)
+        gt_actions     — np.ndarray (N, action_dim) ground-truth step-0 actions
+        pred_actions   — np.ndarray (N, action_dim) predicted step-0 actions
     """
     loader = DataLoader(
         full_dataset,
@@ -238,6 +380,8 @@ def _run_sequence_analysis(
     )
 
     records: list[tuple[int, int, float, float]] = []
+    gt_list:   list[np.ndarray] = []
+    pred_list: list[np.ndarray] = []
     n_total = len(full_dataset)
 
     for i, batch in enumerate(loader):
@@ -248,7 +392,11 @@ def _run_sequence_analysis(
         if n_episodes is not None and ep_idx >= n_episodes:
             break
 
-        # Flow-matching loss
+        # Extract raw GT before preprocess_batch, which may normalize in-place
+        # (dev_batch shares tensor storage with batch when already on the same device)
+        gt_np = _extract_gt_step0(batch)
+        # log.info(f"Seq analysis  |  episode {ep_idx}  frame {fr_idx}  GT step-0 action: {gt_np}")
+
         dev_batch = {
             k: v.to(cfg.device) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
@@ -257,8 +405,11 @@ def _run_sequence_analysis(
         with torch.no_grad():
             loss_val = float(vla.compute_loss(preprocessed).loss.detach())
 
-        l2 = _step0_l2(vla, batch)
+        pred_np = _predict_step0(vla, batch)
+        l2 = float(_action_errors(pred_np, gt_np)[0])
         records.append((ep_idx, fr_idx, loss_val, l2))
+        gt_list.append(gt_np)
+        pred_list.append(pred_np)
 
         if (i + 1) % max(1, min(n_total, 500) // 10) == 0:
             log.info(
@@ -266,7 +417,9 @@ def _run_sequence_analysis(
                 i + 1, ep_idx, fr_idx, loss_val, l2,
             )
 
-    return records
+    gt_actions   = np.stack(gt_list,   axis=0) if gt_list   else np.empty((0,))
+    pred_actions = np.stack(pred_list, axis=0) if pred_list else np.empty((0,))
+    return records, gt_actions, pred_actions
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +444,13 @@ def main(cfg: DictConfig) -> None:
     action_dim = int(_probe["action"].shape[-1])
     image_keys = [k[len("observation.images."):] for k in _probe if k.startswith("observation.images.")]
     log.info("Inferred  action_dim=%d  state_dim=%d  image_keys=%s", action_dim, state_dim, image_keys)
+    _validate_action_contract(action_dim=action_dim, state_dim=state_dim)
+    log.info(
+        "Offline contract: %s; %s; use_relative_actions=%s",
+        _action_mode_label(action_dim),
+        _state_mode_label(state_dim),
+        _use_relative_actions(cfg),
+    )
 
     log.info("Loading model...")
     vla = _load_model(cfg, action_dim=action_dim, state_dim=state_dim, image_keys=image_keys)
@@ -308,6 +468,7 @@ def main(cfg: DictConfig) -> None:
 
     per_step_l2  = np.zeros(chunk_size)
     per_step_mse = np.zeros(chunk_size)
+    per_step_counts = np.zeros(chunk_size)
     per_dim_mse: np.ndarray | None = None
     val_losses: list[float] = []
 
@@ -328,22 +489,26 @@ def main(cfg: DictConfig) -> None:
         gt   = batch["action"].squeeze(0).cpu().float().numpy() # (T, A)
         T = min(pred.shape[0], gt.shape[0])
         pred, gt = pred[:T], gt[:T]
+        valid = _valid_action_steps(batch, T)
 
-        l2  = np.linalg.norm(pred - gt, axis=-1)
-        mse = np.mean((pred - gt) ** 2, axis=-1)
-        per_step_l2[:T]  += l2
-        per_step_mse[:T] += mse
+        l2, mse, sq = _action_errors(pred, gt)
+        per_step_l2[:T]  += np.where(valid, l2, 0.0)
+        per_step_mse[:T] += np.where(valid, mse, 0.0)
+        per_step_counts[:T] += valid.astype(np.float64)
 
         if per_dim_mse is None:
             per_dim_mse = np.zeros((chunk_size, gt.shape[-1]))
-        per_dim_mse[:T] += (pred - gt) ** 2
+        per_dim_mse[:T] += sq * valid[:, None]
 
         if (i + 1) % max(1, n_samples // 10) == 0:
             log.info("  [%d/%d]  loss=%.4f  L2_step0=%.4f", i + 1, n_samples, val_losses[-1], l2[0])
 
-    per_step_l2  /= len(val_losses)
-    per_step_mse /= len(val_losses)
-    per_dim_mse  /= len(val_losses)
+    if not val_losses or per_dim_mse is None:
+        raise RuntimeError("No validation samples were processed; set n_samples > 0.")
+
+    per_step_l2 = _masked_average(per_step_l2, per_step_counts)
+    per_step_mse = _masked_average(per_step_mse, per_step_counts)
+    per_dim_mse = _masked_average(per_dim_mse, per_step_counts[:, None])
     mean_loss = float(np.mean(val_losses))
     log.info("Mean val loss: %.4f  |  L2 step0: %.4f  |  L2 last: %.4f",
              mean_loss, float(per_step_l2[0]), float(per_step_l2[-1]))
@@ -352,6 +517,7 @@ def main(cfg: DictConfig) -> None:
     np.save(out_dir / "per_step_l2.npy",  per_step_l2)
     np.save(out_dir / "per_step_mse.npy", per_step_mse)
     np.save(out_dir / "per_dim_mse.npy",  per_dim_mse)
+    np.save(out_dir / "per_step_counts.npy", per_step_counts)
 
     # -----------------------------------------------------------------------
     # Pass 2: sequence analysis over the FULL dataset in temporal order
@@ -363,14 +529,18 @@ def main(cfg: DictConfig) -> None:
     else:
         log.info("Running sequence analysis over all episodes...")
 
-    seq_records = _run_sequence_analysis(vla, full_dataset, cfg, n_seq_episodes, log)
+    seq_records, seq_gt_actions, seq_pred_actions = _run_sequence_analysis(
+        vla, full_dataset, cfg, n_seq_episodes, log
+    )
     seq_episodes = np.array([r[0] for r in seq_records], dtype=int)
     seq_frames   = np.array([r[1] for r in seq_records], dtype=int)
     seq_loss     = np.array([r[2] for r in seq_records])
     seq_l2       = np.array([r[3] for r in seq_records])
 
-    np.save(out_dir / "sequence_loss.npy", seq_loss)
-    np.save(out_dir / "sequence_l2.npy",   seq_l2)
+    np.save(out_dir / "sequence_loss.npy",         seq_loss)
+    np.save(out_dir / "sequence_l2.npy",           seq_l2)
+    np.save(out_dir / "sequence_gt_actions.npy",   seq_gt_actions)
+    np.save(out_dir / "sequence_pred_actions.npy", seq_pred_actions)
 
     # -----------------------------------------------------------------------
     # Plots
@@ -378,17 +548,17 @@ def main(cfg: DictConfig) -> None:
     import matplotlib.pyplot as plt
 
     ckpt_label = str(cfg.model.kwargs.get("pretrained_name_or_path", ""))
+    action_mode = _action_mode_label(action_dim)
+    if _use_relative_actions(cfg):
+        action_mode += " (relative model output inverted to absolute for plots)"
     steps = np.arange(chunk_size)
     adim = per_dim_mse.shape[-1]
-    dim_labels = (
-        ["x", "y", "z", "qw", "qx", "qy", "qz", "grip"][:adim]
-        if adim == 8 else [f"d{d}" for d in range(adim)]
-    )
+    dim_labels = _action_dim_labels(adim)
 
     # --- Plot 1: chunk-horizon analysis ---
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     fig.suptitle(
-        f"Offline Action Prediction  —  {n_samples} val samples\nckpt: {ckpt_label}",
+        f"Offline Action Prediction - {n_samples} val samples - {action_mode}\nckpt: {ckpt_label}",
         fontsize=10,
     )
 
@@ -445,12 +615,12 @@ def main(cfg: DictConfig) -> None:
     fig2, (ax_loss, ax_l2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
     ep_label = f"{len(set(seq_episodes.tolist()))} episode(s), {len(seq_records)} frames"
     fig2.suptitle(
-        f"Loss / L2 Error over Full Task Sequence  —  {ep_label}\nckpt: {ckpt_label}",
+        f"Loss / L2 Error over Full Task Sequence - {ep_label} - {action_mode}\nckpt: {ckpt_label}",
         fontsize=10,
     )
 
     for ax, values, ylabel, title, color in (
-        (ax_loss, seq_loss, "Flow-matching loss",           "Flow-Matching Loss per Timestep",  "steelblue"),
+        (ax_loss, seq_loss, "Action-chunk flow loss",       "Action-Chunk Flow Loss per Timestep",  "steelblue"),
         (ax_l2,  seq_l2,   "Step-0 L2  ||pred - GT||₂",   "Step-0 L2 Error per Timestep",     "darkorange"),
     ):
         ax.plot(x_pos, values, linewidth=0.8, color=color, alpha=0.8)
@@ -475,12 +645,53 @@ def main(cfg: DictConfig) -> None:
     plt.savefig(seq_plot_path, dpi=150)
     plt.close()
 
+    # --- Plot 3: GT vs predicted actions per dimension over full sequence ---
+    seq_adim = seq_gt_actions.shape[-1] if seq_gt_actions.ndim == 2 else 0
+    if seq_adim > 0:
+        seq_pred_plot, seq_gt_plot = _align_action_for_error(seq_pred_actions, seq_gt_actions)
+        seq_dim_labels = _action_dim_labels(seq_adim)
+        ncols = min(4, seq_adim)
+        nrows = (seq_adim + ncols - 1) // ncols
+        fig3, axes3 = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows), sharex=True)
+        axes3_flat = np.array(axes3).flatten()
+        fig3.suptitle(
+            f"GT vs Predicted Actions per Dimension - {ep_label} - {action_mode}\nckpt: {ckpt_label}",
+            fontsize=10,
+        )
+        for d in range(seq_adim):
+            ax = axes3_flat[d]
+            ax.plot(x_pos, seq_gt_plot[:, d],   color="steelblue",  linewidth=0.8,
+                    alpha=0.9, label="GT")
+            ax.plot(x_pos, seq_pred_plot[:, d], color="darkorange", linewidth=0.8,
+                    alpha=0.9, label="pred", linestyle="--")
+            for b in ep_boundaries:
+                ax.axvline(b, color="gray", linestyle=":", linewidth=0.6, alpha=0.5)
+            ax.set_title(seq_dim_labels[d], fontsize=9)
+            ax.grid(True, alpha=0.3)
+            if d == 0:
+                ax.legend(fontsize=7)
+        for d in range(seq_adim, len(axes3_flat)):
+            axes3_flat[d].set_visible(False)
+        axes3_flat[min(seq_adim - 1, len(axes3_flat) - 1)].set_xlabel(
+            "Frame index (episode-by-episode)"
+        )
+        plt.tight_layout()
+        action_plot_path = out_dir / "sequence_actions.png"
+        plt.savefig(action_plot_path, dpi=150)
+        plt.close()
+    else:
+        action_plot_path = None
+
     log.info("Saved chunk plot    -> %s", plot_path)
     log.info("Saved sequence plot -> %s", seq_plot_path)
+    if action_plot_path:
+        log.info("Saved action plot   -> %s", action_plot_path)
     log.info("Saved arrays        -> %s/", out_dir)
     print(f"[offline_predict_test] mean val loss:   {mean_loss:.4f}", flush=True)
     print(f"[offline_predict_test] chunk plot:      {plot_path}", flush=True)
     print(f"[offline_predict_test] sequence plot:   {seq_plot_path}", flush=True)
+    if action_plot_path:
+        print(f"[offline_predict_test] action plot:     {action_plot_path}", flush=True)
 
 
 if __name__ == "__main__":

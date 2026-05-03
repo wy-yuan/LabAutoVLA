@@ -5,9 +5,12 @@ name: smolvla
 
 kwargs:
   # lerobot/smolvla_base
-  pretrained_name_or_path: outputs/20260425_001731_smolvla_bc/ckpt_epoch0010
-  chunk_size: 50             # null -> use SmolVLA default
-  n_action_steps: 10
+  pretrained_name_or_path: lerobot/smolvla_base
+  # pretrained_name_or_path: outputs/20260429_204038_smolvla_bc/ckpt_epoch0030
+  chunk_size: 80             # null -> use SmolVLA default
+  n_action_steps: 5
+  use_relative_actions: False
+  step0_loss_weight: 1.0   # extra weight on step-0; 1.0 = disabled
   freeze_vision_encoder: false
   train_expert_only: false
   load_pretrained: true

@@ -110,6 +110,12 @@ def _build_policy(cfg: DictConfig, obs: dict[str, Any], action_dim: int):
     model_kwargs["device"] = cfg.device
 
     log = logging.getLogger(__name__)
+    if state_dim != 9:
+        raise ValueError(
+            "Expected compact 9D evaluation state "
+            "[ee_pos(3), ee_quat(4), gripper_pos(2)], "
+            f"but adapter produced state_dim={state_dim}."
+        )
     log.info(
         "Building VLA model name=%s state_dim=%d action_dim=%d image_keys=%s",
         cfg.model.name,

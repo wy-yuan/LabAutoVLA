@@ -21,6 +21,7 @@ from matterix_sm.robot_action_spaces import FRANKA_IK_ACTION_SPACE
 
 import isaaclab.envs.mdp as isaaclab_mdp
 import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
 from isaaclab.sim import RenderCfg, SimulationCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -34,16 +35,22 @@ SOURCE_FLUID_CENTER_OFFSET = (0.0, 0.0, 0.01)
 """Fluid cuboid center relative to the source beaker root pose."""
 
 
-def reset_source_fluid_to_beaker(env, env_ids=None):
+def _resolve_env_ids(env, env_ids):
+    """Return reset env ids as a tensor on the environment device."""
+    if env_ids is None:
+        return torch.arange(env.num_envs, dtype=torch.long, device=env.device)
+    if not isinstance(env_ids, torch.Tensor):
+        return torch.as_tensor(env_ids, dtype=torch.long, device=env.device).flatten()
+    return env_ids.to(device=env.device, dtype=torch.long).flatten()
+
+
+def reset_source_fluid_to_beaker(env, env_ids):
     """Re-anchor the source fluid inside the randomized source beaker."""
     scene_keys = set(env.scene.keys())
     if "source_fluid" not in env.particle_systems or "source_beaker" not in scene_keys:
         return
 
-    if env_ids is None:
-        env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
-    elif not isinstance(env_ids, torch.Tensor):
-        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device)
+    env_ids = _resolve_env_ids(env, env_ids)
 
     fluid_cfg = env.cfg.particle_systems["source_fluid"]
     volume = torch.tensor(fluid_cfg.volume, dtype=torch.float32, device=env.device)
@@ -54,6 +61,70 @@ def reset_source_fluid_to_beaker(env, env_ids=None):
     lower_positions_list = [tuple(pos.tolist()) for pos in lower_positions]
 
     env.particle_systems["source_fluid"].reset(env_ids=env_ids, pos=lower_positions_list)
+
+
+def reset_randomize_pipette_rack(env, env_ids, pose_range, rack_name="pipette_rack"):
+    """Randomize the static pipette rack around its configured default pose."""
+    if rack_name not in set(env.scene.keys()) or rack_name not in env.cfg.objects:
+        return
+
+    env_ids = _resolve_env_ids(env, env_ids)
+
+    rack = env.scene[rack_name]
+    rack_cfg = env.cfg.objects[rack_name]
+    default_pos = torch.tensor(rack_cfg.init_state.pos, dtype=torch.float32, device=env.device)
+    default_quat = torch.tensor(rack_cfg.init_state.rot, dtype=torch.float32, device=env.device)
+
+    range_list = [pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+    ranges = torch.tensor(range_list, dtype=torch.float32, device=env.device)
+    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=env.device)
+
+    positions = default_pos.unsqueeze(0) + env.scene.env_origins[env_ids] + rand_samples[:, 0:3]
+    orientations_delta = math_utils.quat_from_euler_xyz(
+        rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
+    )
+    orientations = math_utils.quat_mul(default_quat.unsqueeze(0).expand(len(env_ids), -1), orientations_delta)
+
+    rack.set_world_poses(positions=positions, orientations=orientations, indices=env_ids)
+
+
+def reset_pipette_to_pipette_rack(env, env_ids, rack_name="pipette_rack", pipette_name="pipette"):
+    """Place the pipette at its configured rack-relative pose after rack randomization."""
+    scene_keys = set(env.scene.keys())
+    if rack_name not in scene_keys or pipette_name not in scene_keys:
+        return
+    if rack_name not in env.cfg.objects or pipette_name not in env.cfg.objects:
+        return
+
+    env_ids = _resolve_env_ids(env, env_ids)
+
+    rack = env.scene[rack_name]
+    pipette = env.scene[pipette_name]
+    rack_cfg = env.cfg.objects[rack_name]
+    pipette_cfg = env.cfg.objects[pipette_name]
+
+    default_rack_pos = torch.tensor(rack_cfg.init_state.pos, dtype=torch.float32, device=env.device)
+    default_rack_quat = torch.tensor(rack_cfg.init_state.rot, dtype=torch.float32, device=env.device)
+    default_pipette_pos = torch.tensor(pipette_cfg.init_state.pos, dtype=torch.float32, device=env.device)
+    default_pipette_quat = torch.tensor(pipette_cfg.init_state.rot, dtype=torch.float32, device=env.device)
+
+    relative_pos = math_utils.quat_apply_inverse(default_rack_quat, default_pipette_pos - default_rack_pos)
+    relative_quat = math_utils.quat_mul(math_utils.quat_inv(default_rack_quat), default_pipette_quat)
+
+    rack_positions, rack_orientations = rack.get_world_poses(indices=env_ids)
+    pipette_positions, pipette_orientations = math_utils.combine_frame_transforms(
+        rack_positions,
+        rack_orientations,
+        relative_pos.unsqueeze(0).expand(len(env_ids), -1),
+        relative_quat.unsqueeze(0).expand(len(env_ids), -1),
+    )
+
+    pipette.write_root_pose_to_sim(
+        torch.cat([pipette_positions, pipette_orientations], dim=-1),
+        env_ids=env_ids,
+    )
+    zero_velocity = torch.zeros((len(env_ids), 6), dtype=torch.float32, device=env.device)
+    pipette.write_root_velocity_to_sim(zero_velocity, env_ids)
 
 
 ##
@@ -135,6 +206,23 @@ class EventCfg(EventManagerCfg):
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("target_beaker"),
         },
+    )
+
+    randomize_pipette_rack = EventTerm(
+        func=reset_randomize_pipette_rack,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (-0.05, 0.05),
+                "y": (-0.05, 0.05),
+                "z": (0.0, 0.0),
+            },
+        },
+    )
+
+    sync_pipette_to_pipette_rack = EventTerm(
+        func=reset_pipette_to_pipette_rack,
+        mode="reset",
     )
 
     sync_source_fluid_to_beaker = EventTerm(
@@ -263,8 +351,8 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
     objects = {
         # "pipette": PIPETTE_1ML_INST_CFG(pos=(0.6518, -0.275, 0.01)),
         # "pipette_rack": PIPETTE_RACK_CFG(pos=(0.65, -0.3, 0.0)),
-        "pipette": PIPETTE_1ML_INST_CFG(pos=(0.55, -0.3, 0.05)),
-        "pipette_rack": PIPETTE_RACK_CFG(pos=(0.55, -0.3, 0.0)),
+        "pipette": PIPETTE_1ML_INST_CFG(pos=(0.55, -0.2, 0.05)),
+        "pipette_rack": PIPETTE_RACK_CFG(pos=(0.55, -0.2, 0.0)),
         "source_beaker": BEAKER_SOURCE_CFG(pos=(0.6, 0.2, 0.05)),
         "target_beaker": BEAKER_TARGET_CFG(pos=(0.6, 0.0, 0.05)),
         "table": TABLE_SEATTLE_INST_Cfg(pos=(0.5, 0.0, 0.0)),

@@ -30,6 +30,7 @@ from __future__ import annotations
 import faulthandler
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -209,6 +210,40 @@ def _build_dataset(cfg: DictConfig):
     )
 
 
+def _compute_relative_action_stats(
+    dataset, batch_size: int = 256, num_workers: int = 0
+) -> dict[str, torch.Tensor]:
+    """Compute mean/std/min/max for relative actions over the full dataset.
+
+    Each action chunk is expressed relative to the current observation state
+    (pos delta, relative rotation, absolute gripper), matching the conversion
+    done in SmolVLA.compute_loss when use_relative_actions=True.
+
+    Returns a dict with keys 'mean', 'std', 'min', 'max', each (action_dim,).
+    """
+    from torch.utils.data import DataLoader
+    from vla.models.smolvla import actions_to_relative
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    chunks: list[torch.Tensor] = []
+    for batch in loader:
+        state = batch["observation.state"]   # (B, state_dim)
+        action = batch["action"]             # (B, T, action_dim) or (B, action_dim)
+        rel = actions_to_relative(action.float(), state.float())
+        if rel.ndim == 3:
+            rel = rel.flatten(0, 1)          # (B*T, action_dim)
+        chunks.append(rel.cpu())
+
+    all_rel = torch.cat(chunks, dim=0)       # (N, action_dim)
+    std, mean = torch.std_mean(all_rel, dim=0)
+    return {
+        "mean": mean,
+        "std": std.clamp(min=1e-6),
+        "min": all_rel.min(dim=0).values,
+        "max": all_rel.max(dim=0).values,
+    }
+
+
 def _build_optimizer(model: torch.nn.Module, cfg: DictConfig) -> torch.optim.Optimizer:
     decay, no_decay = [], []
     for n, p in model.named_parameters():
@@ -223,6 +258,33 @@ def _build_optimizer(model: torch.nn.Module, cfg: DictConfig) -> torch.optim.Opt
         {"params": no_decay, "weight_decay": 0.0},
     ]
     return torch.optim.AdamW(groups, lr=cfg.mode.optim.lr, betas=tuple(cfg.mode.optim.betas))
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: DictConfig,
+    total_steps: int,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    scheduler_name = cfg.mode.get("scheduler", None)
+    if scheduler_name is None:
+        return None
+
+    scheduler_name = str(scheduler_name).lower()
+    warmup_steps = int(cfg.mode.get("scheduler_warmup_steps", 0))
+    total_steps = max(1, int(total_steps))
+
+    if scheduler_name != "cosine":
+        raise ValueError(f"Unsupported BC scheduler '{scheduler_name}' (expected 'cosine' or null)")
+
+    def lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, float(current_step - warmup_steps) / float(decay_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def _split_train_val_dataset(dataset, val_fraction: float, seed: int):
@@ -323,6 +385,8 @@ class _LazyEvaluator:
         from vla.training.evaluator import RolloutEvaluator
 
         env_cfg = parse_env_cfg(self.cfg.task.id, device=self.cfg.mode.device, num_envs=1)
+        # if not self.cfg.mode.eval.get("use_async_envs", True):
+        #     env_cfg.use_async_envs = False
         spec = gym.spec(self.cfg.task.id)
         log.info(
             "Building evaluator env id=%s entry_point=%s kwargs=%s device=%s num_envs=%s",
@@ -519,6 +583,20 @@ def run_bc(cfg: DictConfig) -> None:
     sample = dataset[0]
     state_dim = int(sample["observation.state"].shape[-1])
     action_dim = int(sample["action"].shape[-1])
+    if action_dim != 8:
+        raise ValueError(
+            "Expected 8D base-frame actions "
+            "[ee_pos_base(3), ee_quat_base(4), gripper_open(1)], "
+            f"but dataset action_dim={action_dim}. Regenerate/reconvert the dataset "
+            "with data.generate_dataset after the base-frame action patch."
+        )
+    if state_dim != 9:
+        raise ValueError(
+            "Expected compact 9D observation.state "
+            "[ee_pos(3), ee_quat(4), gripper_pos(2)], "
+            f"but dataset state_dim={state_dim}. Regenerate/reconvert the dataset "
+            "with the updated task adapter."
+        )
     image_keys = [
         k.replace("observation.images.", "")
         for k in sample.keys()
@@ -544,8 +622,34 @@ def run_bc(cfg: DictConfig) -> None:
     vla.to(device)
     log.info("Model ready on device=%s", device)
 
+    use_relative = bool(OmegaConf.to_container(cfg.model.kwargs, resolve=True).get("use_relative_actions", False))
+    if use_relative:
+        log.info("use_relative_actions=True — computing relative action stats from dataset")
+        print("[bc_train] Computing relative action stats...", flush=True)
+        rel_stats = _compute_relative_action_stats(
+            dataset,
+            batch_size=int(cfg.mode.batch_size) * 4,
+            num_workers=int(cfg.mode.num_workers),
+        )
+        log.info(
+            "Relative action stats: mean=%s std=%s",
+            rel_stats["mean"].tolist(),
+            rel_stats["std"].tolist(),
+        )
+        vla.update_action_normalizer_stats(rel_stats["mean"], rel_stats["std"])
+        print("[bc_train] Relative action stats injected into policy normalizer.", flush=True)
+
     # -- Optim + Logger ------------------------------------------------
     optim = _build_optimizer(vla, cfg)
+    total_train_steps = len(train_loader) * int(cfg.mode.epochs)
+    scheduler = _build_scheduler(optim, cfg, total_train_steps)
+    if scheduler is not None:
+        log.info(
+            "Using %s scheduler with warmup_steps=%d total_steps=%d",
+            cfg.mode.scheduler,
+            int(cfg.mode.get("scheduler_warmup_steps", 0)),
+            total_train_steps,
+        )
     from vla.utils.logging import Logger
 
     logger = Logger(
@@ -580,8 +684,11 @@ def run_bc(cfg: DictConfig) -> None:
                 if cfg.mode.optim.grad_clip:
                     torch.nn.utils.clip_grad_norm_(vla.parameters(), cfg.mode.optim.grad_clip)
                 optim.step()
+                if scheduler is not None:
+                    scheduler.step()
 
                 logger.scalar("train/loss", float(loss.detach()), global_step)
+                logger.scalar("train/lr", float(optim.param_groups[0]["lr"]), global_step)
                 if out.aux:
                     for key, value in out.aux.items():
                         if isinstance(value, torch.Tensor) and value.numel() == 1:

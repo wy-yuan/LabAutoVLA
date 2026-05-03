@@ -292,6 +292,61 @@ def _extract_env0_tree(value: Any) -> Any:
     return np.asarray(value)
 
 
+def _drop_recorded_robot_root_pose(obs: dict[str, Any]) -> dict[str, Any]:
+    """Remove fixed robot root pose from observations written to HDF5."""
+    articulations = obs.get("articulations")
+    if isinstance(articulations, dict):
+        articulations.pop("robot__root_world_pos", None)
+        articulations.pop("robot__root_world_quat", None)
+    return obs
+
+
+_DEFAULT_PROPRIO_KEYS: list[str] = [
+    "articulations/robot__ee_world_pos",
+    "articulations/robot__ee_world_quat",
+    "articulations/robot__gripper_pos",
+]
+
+
+def _extract_proprio(obs: dict[str, Any], state_keys: list[str]) -> torch.Tensor:
+    """Concatenate proprio state for env-0 from a raw multi-env obs dict.
+
+    Traverses slash-separated paths (e.g. ``"articulations/robot__ee_world_pos"``)
+    and returns a flat float32 tensor of the concatenated values for env index 0.
+    """
+    parts: list[torch.Tensor] = []
+    for key in state_keys:
+        node: Any = obs
+        for part in key.split("/"):
+            node = node[part]
+        if isinstance(node, torch.Tensor):
+            vec = node[0].detach().cpu().float().flatten()
+        else:
+            vec = torch.tensor(np.asarray(node)[0], dtype=torch.float32).flatten()
+        parts.append(vec)
+    return torch.cat(parts, dim=0)
+
+
+def _extract_next_ee_action_base(obs: dict[str, Any]) -> torch.Tensor:
+    """Return achieved next EE pose in the env's 8D base-frame action layout.
+
+    The current pipetting robot base is fixed at the world origin, so world EE
+    pose and base-frame EE pose are equivalent.
+    """
+
+    artic = obs["articulations"]
+
+    ee_pos_w = artic["robot__ee_world_pos"]
+    ee_quat_w = artic["robot__ee_world_quat"]
+
+    finger_pos = artic["robot__gripper_pos"]  # (N, 2)
+    gripper_open = (
+        finger_pos.abs().clamp(0.0, 0.04).mean(dim=-1, keepdim=True) / 0.04
+    )
+
+    return torch.cat([ee_pos_w, ee_quat_w, gripper_open], dim=-1)[0].detach().cpu().float()
+
+
 def _stack_tree(values: list[Any]) -> Any:
     """Stack a list of nested tensors/arrays into a trajectory tree."""
     first = values[0]
@@ -333,10 +388,19 @@ def execute_episode(
     task_prompt: str,
     cfg: DictConfig,
     max_steps: int | None = None,
+    proprio_keys: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Execute a single episode and return raw HDF5-ready observations/actions."""
+    """Execute a single episode and return raw HDF5-ready observations/actions.
+
+    Actions are recorded as the achieved next EE pose in robot base frame,
+    plus achieved gripper opening. This gives dense 8D targets matching the
+    env's pose-action layout without using the state machine's constant
+    waypoint command directly.
+    """
     if max_steps is None:
         max_steps = cfg.generation.max_steps
+    if proprio_keys is None:
+        proprio_keys = _DEFAULT_PROPRIO_KEYS
 
     raw_obs_steps: list[dict[str, Any]] = []
     raw_action_steps: list[torch.Tensor] = []
@@ -346,12 +410,14 @@ def execute_episode(
     workflow_executor.reset()
 
     for _ in range(max_steps):
-        raw_obs_steps.append(_extract_env0_tree(obs))
+        raw_obs_steps.append(_drop_recorded_robot_root_pose(_extract_env0_tree(obs)))
 
         action_tensor = workflow_executor.step(obs)
-        raw_action_steps.append(action_tensor[0].detach().cpu().to(torch.float32))
-
         obs, _, terminated, truncated, _ = env.step(action_tensor)
+
+        # Record where the robot actually ended up after this step. Using the
+        # state machine's goal directly produces constant actions per primitive.
+        raw_action_steps.append(_extract_next_ee_action_base(obs))
 
         workflow_done = workflow_executor.is_done(env_index=0)
         env_done = _env0_done(terminated) or _env0_done(truncated)
@@ -438,6 +504,11 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
             domain_state = extract_domain_state(env, task_id)
             task_prompt = language_gens[task_alias].generate(**domain_state)
 
+            task_spec = task_specs[task_alias]
+            proprio_keys = list(
+                OmegaConf.to_container(task_spec.cfg.adapter.state_keys, resolve=True)
+            ) if "adapter" in task_spec.cfg and "state_keys" in task_spec.cfg.adapter else None
+
             try:
                 episode_data = execute_episode(
                     env=env,
@@ -445,6 +516,7 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
                     task_id=task_id,
                     task_prompt=task_prompt,
                     cfg=cfg,
+                    proprio_keys=proprio_keys,
                 )
 
                 if cfg.generation.only_successful and not episode_data["success"]:

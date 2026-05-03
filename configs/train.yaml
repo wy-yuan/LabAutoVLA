@@ -15,11 +15,11 @@ defaults:
 
 # Default dataset location for pipetting training.
 dataset:
-  src_hdf5: data/datasets/hdf5/pipetting_ep100/pipetting.hdf5
-  root: data/datasets/pipetting_ep100
-  repo_id: local/pipetting_ep100
+  src_hdf5: data/datasets/hdf5/pipetting_v2_ep50/pipetting.hdf5
+  root: data/datasets/pipetting_v2_ep50
+  repo_id: local/pipetting_v2_ep50
   fps: 30
-  action_chunk_size: 50
+  action_chunk_size: 80
 
 # Where every output (ckpts, videos, TB logs) lands for this run.
 output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_${mode.name}

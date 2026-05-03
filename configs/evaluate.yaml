@@ -16,8 +16,8 @@ defaults:
 device: "cuda:0"
 
 eval:
-  n_episodes: 2
-  max_steps: 500
+  n_episodes: 1
+  max_steps: 400
 
 dataset:
   fps: 30
