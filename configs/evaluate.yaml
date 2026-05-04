@@ -20,7 +20,12 @@ eval:
   max_steps: 400
 
 dataset:
+  root: data/datasets/pipetting_v2_ep50
+  repo_id: local/pipetting_v2_ep50
   fps: 30
+  action_chunk_size: 80
+  stats_batch_size: 256
+  stats_num_workers: 0
 
 output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_eval
 

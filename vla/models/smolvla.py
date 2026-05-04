@@ -17,6 +17,8 @@ Why a thin wrapper rather than subclassing ``SmolVLAPolicy`` directly?
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -24,6 +26,10 @@ import torch
 
 from .base_vla import BaseVLA, VLAOutput
 from .registry import register_vla
+
+log = logging.getLogger(__name__)
+
+_ACTION_NORMALIZATION_FILE = "action_normalization.json"
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +204,9 @@ class SmolVLA(BaseVLA):
         super().__init__(action_dim=action_dim, state_dim=state_dim, image_keys=image_keys)
         self.use_relative_actions = use_relative_actions
         self.step0_loss_weight = step0_loss_weight
+        self._action_norm_mean: torch.Tensor | None = None
+        self._action_norm_std: torch.Tensor | None = None
+        self._action_norm_mode = "relative" if self.use_relative_actions else "absolute"
         # Tracks which step in the current action chunk we are (for inference).
         self._rel_base_state: torch.Tensor | None = None
         self._rel_step_in_chunk: int = 0
@@ -254,6 +263,7 @@ class SmolVLA(BaseVLA):
 
         self._device = torch.device(device)
         self.to(self._device)
+        self._load_action_normalizer_from_checkpoint(pretrained_name_or_path)
 
     # ------------------------------------------------------------------
     # Contract
@@ -263,6 +273,7 @@ class SmolVLA(BaseVLA):
         batch = self._move_to_device(batch)
         if self.use_relative_actions:
             batch = self._batch_to_relative(batch)
+        batch = self._batch_to_normalized_action(batch)
         # LeRobot policies return either a dict (preferred) or a tuple
         # (loss, info). We normalise.
         result = self.policy.forward(batch)
@@ -323,6 +334,7 @@ class SmolVLA(BaseVLA):
         # ``select_action`` streams one action per call out of the internal
         # chunk buffer; call ``reset()`` between episodes (see BaseVLA.reset).
         action = self.policy.select_action(observation)
+        action = self._unnormalize_action(action)
 
         if self.use_relative_actions and self._rel_base_state is not None:
             action = actions_to_absolute(action, self._rel_base_state)
@@ -369,29 +381,72 @@ class SmolVLA(BaseVLA):
         processed["action"] = actions_to_relative(action, state)
         return processed
 
-    def update_action_normalizer_stats(
-        self, mean: torch.Tensor, std: torch.Tensor
-    ) -> None:
-        """Inject relative-action stats into the policy's normalizer buffers.
+    def _batch_to_normalized_action(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Normalize the ``action`` field with the installed action stats."""
+        processed = dict(batch)
+        action = batch.get("action")
+        if action is None:
+            return processed
+        processed["action"] = self._normalize_action(action)
+        return processed
 
-        Called by bc_train when use_relative_actions=True so the policy's
-        internal normalization matches the relative action distribution.
+    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Map env/relative action units into model target units."""
+        if self._action_norm_mean is None or self._action_norm_std is None:
+            return action
+        mean = self._action_norm_mean.to(device=action.device, dtype=action.dtype)
+        std = self._action_norm_std.to(device=action.device, dtype=action.dtype)
+        return (action - mean) / std.clamp_min(1e-6)
+
+    def _unnormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Map model output units back into env/relative action units."""
+        if self._action_norm_mean is None or self._action_norm_std is None:
+            return action
+        mean = self._action_norm_mean.to(device=action.device, dtype=action.dtype)
+        std = self._action_norm_std.to(device=action.device, dtype=action.dtype)
+        return action * std.clamp_min(1e-6) + mean
+
+    def has_action_normalizer_stats(self) -> bool:
+        """Return whether explicit action normalization stats are installed."""
+        return self._action_norm_mean is not None and self._action_norm_std is not None
+
+    def update_action_normalizer_stats(
+        self,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        mode: str | None = None,
+    ) -> None:
+        """Install action stats used by this wrapper and LeRobot processors.
+
+        The wrapper applies these stats explicitly before ``policy.forward``
+        and after ``policy.select_action``. We also mirror them into LeRobot's
+        config/buffers so checkpoints stay compatible with processor-based
+        tooling.
         """
         try:
             from lerobot.utils.constants import ACTION
         except ImportError:
-            return
+            ACTION = "action"
 
         dev = self._device
-        mean_d = mean.to(dev)
-        std_d = std.to(dev)
+        mean_d = mean.detach().float().to(dev)
+        std_d = std.detach().float().clamp(min=1e-6).to(dev)
+        self._action_norm_mean = mean_d.clone()
+        self._action_norm_std = std_d.clone()
+        if mode is not None:
+            if mode not in ("absolute", "relative"):
+                raise ValueError(f"Unsupported action normalization mode: {mode!r}")
+            self._action_norm_mode = mode
 
         # Update the config record so the stats persist with the checkpoint.
         if hasattr(self.policy, "config") and self.policy.config is not None:
             ds = getattr(self.policy.config, "dataset_stats", None) or {}
             if not isinstance(ds, dict):
                 ds = {}
-            ds[ACTION] = {"mean": mean_d, "std": std_d}
+            ds[ACTION] = {
+                "mean": mean_d.detach().cpu().tolist(),
+                "std": std_d.detach().cpu().tolist(),
+            }
             try:
                 self.policy.config.dataset_stats = ds
             except Exception:
@@ -412,6 +467,37 @@ class SmolVLA(BaseVLA):
                         submod._buffers[buf_name] = mean_d.clone()
                     elif "std" in buf_name and buf.shape == std_d.shape:
                         submod._buffers[buf_name] = std_d.clone()
+
+    def _load_action_normalizer_from_checkpoint(self, pretrained_name_or_path: str | Path) -> None:
+        """Load explicit action normalization stats saved by ``save_pretrained``."""
+        ckpt_dir = Path(pretrained_name_or_path)
+        if ckpt_dir.suffix == ".safetensors":
+            ckpt_dir = ckpt_dir.parent
+        stats_path = ckpt_dir / _ACTION_NORMALIZATION_FILE
+        if not stats_path.exists():
+            return
+
+        try:
+            payload = json.loads(stats_path.read_text(encoding="utf-8"))
+            mean = torch.tensor(payload["mean"], dtype=torch.float32)
+            std = torch.tensor(payload["std"], dtype=torch.float32)
+        except Exception as exc:
+            log.warning("Failed to load action normalization stats from %s: %s", stats_path, exc)
+            return
+
+        mode = str(payload.get("mode") or self._action_norm_mode)
+        if mode in ("absolute", "relative") and mode != self._action_norm_mode:
+            log.warning(
+                "Checkpoint action normalization mode is %s but config requested %s; "
+                "using checkpoint mode.",
+                mode,
+                self._action_norm_mode,
+            )
+            self.use_relative_actions = mode == "relative"
+            self._action_norm_mode = mode
+
+        self.update_action_normalizer_stats(mean, std, mode=mode)
+        log.info("Loaded %s action normalization stats from %s", mode, stats_path)
 
     # ------------------------------------------------------------------
     # Persistence (prefer HF-native IO so we get safetensors shards)
@@ -455,10 +541,21 @@ class SmolVLA(BaseVLA):
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         self.policy.save_pretrained(save_dir)
+        if self._action_norm_mean is not None and self._action_norm_std is not None:
+            payload = {
+                "mode": self._action_norm_mode,
+                "mean": self._action_norm_mean.detach().cpu().tolist(),
+                "std": self._action_norm_std.detach().cpu().tolist(),
+            }
+            (save_dir / _ACTION_NORMALIZATION_FILE).write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
 
     def load_pretrained(self, load_dir: str | Path, strict: bool = True) -> None:
         self.policy = self.policy.__class__.from_pretrained(load_dir, config=self.cfg)
         self.to(self._device)
+        self._load_action_normalizer_from_checkpoint(load_dir)
 
     # ------------------------------------------------------------------
     # Internal helpers

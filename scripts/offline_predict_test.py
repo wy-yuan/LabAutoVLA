@@ -454,6 +454,25 @@ def main(cfg: DictConfig) -> None:
 
     log.info("Loading model...")
     vla = _load_model(cfg, action_dim=action_dim, state_dim=state_dim, image_keys=image_keys)
+    has_stats = getattr(vla, "has_action_normalizer_stats", None)
+    if callable(has_stats) and not has_stats():
+        from vla.training.bc_train import _compute_action_normalization_stats
+
+        use_relative = bool(getattr(vla, "use_relative_actions", _use_relative_actions(cfg)))
+        mode = "relative" if use_relative else "absolute"
+        log.info("Installing %s action normalization stats from offline dataset...", mode)
+        action_stats = _compute_action_normalization_stats(
+            full_dataset,
+            use_relative_actions=use_relative,
+            action_chunk_size=chunk_size,
+            batch_size=int(cfg.get("stats_batch_size", 256)),
+            num_workers=int(cfg.get("stats_num_workers", 0)),
+        )
+        vla.update_action_normalizer_stats(
+            action_stats["mean"],
+            action_stats["std"],
+            mode=mode,
+        )
 
     # -----------------------------------------------------------------------
     # Pass 1: chunk-horizon analysis over val split

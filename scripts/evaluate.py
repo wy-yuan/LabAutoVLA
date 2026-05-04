@@ -134,6 +134,66 @@ def _build_policy(cfg: DictConfig, obs: dict[str, Any], action_dim: int):
     return vla
 
 
+def _ensure_action_normalization(cfg: DictConfig, vla: Any) -> None:
+    """Install action normalization stats for evaluation when a checkpoint lacks them."""
+    has_stats = getattr(vla, "has_action_normalizer_stats", None)
+    if callable(has_stats) and has_stats():
+        return
+    update_stats = getattr(vla, "update_action_normalizer_stats", None)
+    if not callable(update_stats):
+        return
+
+    dataset_cfg = cfg.get("dataset", {})
+    root_value = dataset_cfg.get("root", None)
+    repo_id = dataset_cfg.get("repo_id", None)
+    if root_value is None or repo_id is None:
+        logging.getLogger(__name__).warning(
+            "No action normalization stats found in checkpoint, and evaluate.dataset.root/repo_id "
+            "are not configured; using raw model action scale."
+        )
+        return
+
+    root = Path(root_value)
+    if not root.exists():
+        logging.getLogger(__name__).warning(
+            "No action normalization stats found in checkpoint, and dataset root does not exist: %s",
+            root,
+        )
+        return
+
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from vla.training.bc_train import (
+        _compute_action_normalization_stats,
+        _ensure_local_episode_metadata,
+    )
+
+    fps = int(dataset_cfg.get("fps", 30))
+    _ensure_local_episode_metadata(root, fps=fps)
+    chunk_size = int(dataset_cfg.get("action_chunk_size", 1))
+    delta_timestamps = {"action": [i / fps for i in range(chunk_size)]}
+    dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=root,
+        delta_timestamps=delta_timestamps,
+    )
+
+    use_relative = bool(getattr(vla, "use_relative_actions", False))
+    mode = "relative" if use_relative else "absolute"
+    stats = _compute_action_normalization_stats(
+        dataset,
+        use_relative_actions=use_relative,
+        action_chunk_size=chunk_size,
+        batch_size=int(dataset_cfg.get("stats_batch_size", 256)),
+        num_workers=int(dataset_cfg.get("stats_num_workers", 0)),
+    )
+    update_stats(stats["mean"], stats["std"], mode=mode)
+    logging.getLogger(__name__).info(
+        "Installed %s action normalization stats from %s for evaluation",
+        mode,
+        root,
+    )
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="evaluate")
 def main(cfg: DictConfig) -> None:
     _configure_logging()
@@ -149,6 +209,7 @@ def main(cfg: DictConfig) -> None:
         obs, _ = env.reset()
         action_dim = _infer_action_dim(env)
         vla = _build_policy(cfg, obs, action_dim)
+        _ensure_action_normalization(cfg, vla)
 
         from vla.training.evaluator import RolloutEvaluator
 

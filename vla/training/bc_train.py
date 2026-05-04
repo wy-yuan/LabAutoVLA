@@ -210,38 +210,164 @@ def _build_dataset(cfg: DictConfig):
     )
 
 
-def _compute_relative_action_stats(
-    dataset, batch_size: int = 256, num_workers: int = 0
-) -> dict[str, torch.Tensor]:
-    """Compute mean/std/min/max for relative actions over the full dataset.
+def _valid_action_rows(batch: dict[str, Any], action: torch.Tensor) -> torch.Tensor | None:
+    """Return a flattened valid-step mask for chunked actions, if available."""
+    if action.ndim != 3:
+        return None
 
-    Each action chunk is expressed relative to the current observation state
-    (pos delta, relative rotation, absolute gripper), matching the conversion
-    done in SmolVLA.compute_loss when use_relative_actions=True.
+    B, T = action.shape[:2]
+    valid = torch.ones(B, T, dtype=torch.bool)
+    pad = batch.get("actions_id_pad", batch.get("action_is_pad"))
+    if pad is None:
+        return valid.flatten()
+
+    pad = torch.as_tensor(pad, dtype=torch.bool)
+    if pad.ndim == 0:
+        pad = pad.expand(B, T)
+    elif pad.ndim == 1:
+        pad = pad[:, None].expand(B, T)
+    else:
+        pad = pad[:, :T]
+        if pad.shape[1] < T:
+            fill = torch.zeros(B, T - pad.shape[1], dtype=torch.bool)
+            pad = torch.cat([pad, fill], dim=1)
+
+    valid = ~pad
+    return valid.flatten()
+
+
+def _compute_action_stats_from_lerobot_parquet(
+    dataset,
+    *,
+    use_relative_actions: bool,
+    action_chunk_size: int | None,
+) -> dict[str, torch.Tensor] | None:
+    """Fast path for local LeRobot datasets that avoids decoding videos."""
+    root = getattr(dataset, "root", None)
+    if root is None:
+        return None
+
+    root = Path(root)
+    data_files = sorted((root / "data").glob("*/*.parquet"))
+    if not data_files:
+        return None
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from vla.models.smolvla import actions_to_relative
+    except ImportError:
+        return None
+
+    columns = ["observation.state", "action", "episode_index", "index"]
+    tables = [pq.read_table(path, columns=columns) for path in data_files]
+    table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    data = table.to_pydict()
+
+    states = torch.tensor(data["observation.state"], dtype=torch.float32)
+    actions = torch.tensor(data["action"], dtype=torch.float32)
+    episode_indices = torch.tensor(data["episode_index"], dtype=torch.long)
+    row_indices = torch.tensor(data["index"], dtype=torch.long)
+    chunk_size = int(action_chunk_size or 1)
+
+    targets: list[torch.Tensor] = []
+    for episode_idx in torch.unique(episode_indices, sorted=True):
+        ep_mask = episode_indices == episode_idx
+        order = torch.argsort(row_indices[ep_mask])
+        ep_states = states[ep_mask][order]
+        ep_actions = actions[ep_mask][order]
+        n_steps = int(ep_actions.shape[0])
+
+        for horizon in range(chunk_size):
+            n_valid = n_steps - horizon
+            if n_valid <= 0:
+                break
+            horizon_actions = ep_actions[horizon : horizon + n_valid]
+            if use_relative_actions:
+                horizon_states = ep_states[:n_valid]
+                horizon_actions = actions_to_relative(horizon_actions, horizon_states)
+            targets.append(horizon_actions)
+
+    if not targets:
+        return None
+
+    all_targets = torch.cat(targets, dim=0)
+    std, mean = torch.std_mean(all_targets, dim=0)
+    return {
+        "mean": mean,
+        "std": std.clamp(min=1e-6),
+        "min": all_targets.min(dim=0).values,
+        "max": all_targets.max(dim=0).values,
+    }
+
+
+def _compute_action_normalization_stats(
+    dataset,
+    *,
+    use_relative_actions: bool,
+    action_chunk_size: int | None = None,
+    batch_size: int = 256,
+    num_workers: int = 0,
+) -> dict[str, torch.Tensor]:
+    """Compute mean/std/min/max for model action targets over the dataset.
+
+    For absolute-action training, this is computed from raw dataset action
+    chunks. For relative-action training, each action chunk is first expressed
+    relative to the current observation state, matching SmolVLA.compute_loss.
 
     Returns a dict with keys 'mean', 'std', 'min', 'max', each (action_dim,).
     """
+    parquet_stats = _compute_action_stats_from_lerobot_parquet(
+        dataset,
+        use_relative_actions=use_relative_actions,
+        action_chunk_size=action_chunk_size,
+    )
+    if parquet_stats is not None:
+        return parquet_stats
+
     from torch.utils.data import DataLoader
     from vla.models.smolvla import actions_to_relative
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     chunks: list[torch.Tensor] = []
     for batch in loader:
-        state = batch["observation.state"]   # (B, state_dim)
         action = batch["action"]             # (B, T, action_dim) or (B, action_dim)
-        rel = actions_to_relative(action.float(), state.float())
-        if rel.ndim == 3:
-            rel = rel.flatten(0, 1)          # (B*T, action_dim)
-        chunks.append(rel.cpu())
+        target = action.float()
+        if use_relative_actions:
+            state = batch["observation.state"]   # (B, state_dim)
+            target = actions_to_relative(target, state.float())
 
-    all_rel = torch.cat(chunks, dim=0)       # (N, action_dim)
-    std, mean = torch.std_mean(all_rel, dim=0)
+        if target.ndim == 3:
+            valid = _valid_action_rows(batch, target)
+            target = target.flatten(0, 1)          # (B*T, action_dim)
+            if valid is not None:
+                target = target[valid.to(target.device)]
+        chunks.append(target.cpu())
+
+    all_targets = torch.cat(chunks, dim=0)       # (N, action_dim)
+    std, mean = torch.std_mean(all_targets, dim=0)
     return {
         "mean": mean,
         "std": std.clamp(min=1e-6),
-        "min": all_rel.min(dim=0).values,
-        "max": all_rel.max(dim=0).values,
+        "min": all_targets.min(dim=0).values,
+        "max": all_targets.max(dim=0).values,
     }
+
+
+def _compute_relative_action_stats(
+    dataset,
+    action_chunk_size: int | None = None,
+    batch_size: int = 256,
+    num_workers: int = 0,
+) -> dict[str, torch.Tensor]:
+    """Backward-compatible wrapper for relative-action stats."""
+    return _compute_action_normalization_stats(
+        dataset,
+        use_relative_actions=True,
+        action_chunk_size=action_chunk_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
 
 
 def _build_optimizer(model: torch.nn.Module, cfg: DictConfig) -> torch.optim.Optimizer:
@@ -622,12 +748,34 @@ def run_bc(cfg: DictConfig) -> None:
     vla.to(device)
     log.info("Model ready on device=%s", device)
 
-    use_relative = bool(OmegaConf.to_container(cfg.model.kwargs, resolve=True).get("use_relative_actions", False))
+    requested_relative = bool(
+        OmegaConf.to_container(cfg.model.kwargs, resolve=True).get("use_relative_actions", False)
+    )
+    use_relative = bool(getattr(vla, "use_relative_actions", requested_relative))
+    if not use_relative:
+        log.info("use_relative_actions=False; computing absolute action stats from dataset")
+        print("[bc_train] Computing absolute action normalization stats...", flush=True)
+        abs_stats = _compute_action_normalization_stats(
+            dataset,
+            use_relative_actions=False,
+            action_chunk_size=int(cfg.dataset.get("action_chunk_size", 1)),
+            batch_size=int(cfg.mode.batch_size) * 4,
+            num_workers=int(cfg.mode.num_workers),
+        )
+        log.info(
+            "Absolute action stats: mean=%s std=%s",
+            abs_stats["mean"].tolist(),
+            abs_stats["std"].tolist(),
+        )
+        vla.update_action_normalizer_stats(abs_stats["mean"], abs_stats["std"], mode="absolute")
+        print("[bc_train] Absolute action stats installed in policy normalizer.", flush=True)
+
     if use_relative:
         log.info("use_relative_actions=True — computing relative action stats from dataset")
         print("[bc_train] Computing relative action stats...", flush=True)
         rel_stats = _compute_relative_action_stats(
             dataset,
+            action_chunk_size=int(cfg.dataset.get("action_chunk_size", 1)),
             batch_size=int(cfg.mode.batch_size) * 4,
             num_workers=int(cfg.mode.num_workers),
         )
@@ -636,7 +784,7 @@ def run_bc(cfg: DictConfig) -> None:
             rel_stats["mean"].tolist(),
             rel_stats["std"].tolist(),
         )
-        vla.update_action_normalizer_stats(rel_stats["mean"], rel_stats["std"])
+        vla.update_action_normalizer_stats(rel_stats["mean"], rel_stats["std"], mode="relative")
         print("[bc_train] Relative action stats injected into policy normalizer.", flush=True)
 
     # -- Optim + Logger ------------------------------------------------

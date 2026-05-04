@@ -18,8 +18,8 @@ defaults:
 device: "cuda:0"
 
 dataset:
-  root: data/datasets/pipetting_ep50
-  repo_id: local/pipetting_ep50
+  root: data/datasets/pipetting_v2_ep50
+  repo_id: local/pipetting_v2_ep50
   fps: 30
   action_chunk_size: 80
 
@@ -32,6 +32,8 @@ n_samples: 1
 
 # null = analyse all episodes in the sequence plot; set e.g. 5 to limit
 n_seq_episodes: 1
+stats_batch_size: 256
+stats_num_workers: 0
 
 output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_offline_test
 
