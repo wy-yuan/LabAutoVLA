@@ -13,6 +13,7 @@
 
 defaults:
   - model: smolvla
+  - task: pipetting          # {pipetting, ...}
   - _self_
 
 device: "cuda:0"

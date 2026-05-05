@@ -37,7 +37,7 @@ from typing import Any
 
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 
 from vla.data.obs_adapter import ObsAdapterConfig
 log = logging.getLogger(__name__)
@@ -201,13 +201,22 @@ def _build_dataset(cfg: DictConfig):
     delta_timestamps = None
     if cfg.dataset.get("action_chunk_size", None):
         k = int(cfg.dataset.action_chunk_size)
-        delta_timestamps = {"action": [i / cfg.dataset.fps for i in range(k)]}
+        image_keys = OmegaConf.to_container(cfg.task.adapter.image_keys, resolve=True)
+        delta_timestamps = {
+            **{
+                f"observation.images.{image_key}": [-0.2, -0.1, 0.0]
+                for image_key in image_keys
+            },
+            "observation.state": [-0.1, 0.0],
+            "action": [i / cfg.dataset.fps for i in range(k)],
+        }
 
-    return LeRobotDataset(
+    dataset = LeRobotDataset(
         repo_id=cfg.dataset.repo_id,
         root=root,
         delta_timestamps=delta_timestamps,
     )
+    return dataset
 
 
 def _valid_action_rows(batch: dict[str, Any], action: torch.Tensor) -> torch.Tensor | None:
@@ -413,25 +422,94 @@ def _build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _episode_indices_from_lerobot_dataset(dataset) -> dict[int, list[int]]:
+    """Return dataset sample indices grouped by episode index."""
+    root = getattr(dataset, "root", None)
+    if root is not None:
+        root = Path(root)
+        data_files = sorted((root / "data").glob("*/*.parquet"))
+        if data_files:
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+
+                tables = [pq.read_table(path, columns=["episode_index", "index"]) for path in data_files]
+                table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+                columns = table.to_pydict()
+                records = sorted(
+                    (int(row_index), int(episode_index))
+                    for row_index, episode_index in zip(columns["index"], columns["episode_index"])
+                )
+                row_indices = [row_index for row_index, _ in records]
+                if (
+                    len(row_indices) == len(dataset)
+                    and len(set(row_indices)) == len(row_indices)
+                    and all(0 <= row_index < len(dataset) for row_index in row_indices)
+                ):
+                    indexed_records = records
+                else:
+                    indexed_records = [
+                        (sample_index, episode_index)
+                        for sample_index, (_, episode_index) in enumerate(records)
+                    ]
+
+                by_episode: dict[int, list[int]] = {}
+                for sample_index, episode_index in indexed_records:
+                    by_episode.setdefault(episode_index, []).append(sample_index)
+                if by_episode:
+                    return by_episode
+            except Exception as exc:
+                log.warning("Falling back to dataset scan for episode split: %s", exc)
+
+    by_episode: dict[int, list[int]] = {}
+    for sample_index in range(len(dataset)):
+        sample = dataset[sample_index]
+        episode_index = int(torch.as_tensor(sample["episode_index"]).item())
+        by_episode.setdefault(episode_index, []).append(sample_index)
+    return by_episode
+
+
 def _split_train_val_dataset(dataset, val_fraction: float, seed: int):
-    """Split one dataset into train/validation subsets."""
+    """Split one dataset into train/validation subsets at episode granularity."""
     if not 0.0 < val_fraction < 1.0:
         raise ValueError(f"mode.validation_fraction must be in (0, 1), got {val_fraction}")
 
-    dataset_size = len(dataset)
-    if dataset_size < 2:
-        raise ValueError("Need at least 2 dataset samples to create a train/validation split")
-
-    val_size = max(1, int(round(dataset_size * val_fraction)))
-    train_size = dataset_size - val_size
-    if train_size < 1:
-        raise ValueError(
-            f"Validation split leaves no training samples: dataset_size={dataset_size}, "
-            f"validation_fraction={val_fraction}"
-        )
+    by_episode = _episode_indices_from_lerobot_dataset(dataset)
+    episode_ids = sorted(by_episode)
+    if len(episode_ids) < 2:
+        raise ValueError("Need at least 2 episodes to create an episode-level train/validation split")
 
     generator = torch.Generator().manual_seed(seed)
-    return random_split(dataset, [train_size, val_size], generator=generator)
+    perm = torch.randperm(len(episode_ids), generator=generator).tolist()
+    val_episode_count = max(1, int(round(len(episode_ids) * val_fraction)))
+    val_episode_count = min(val_episode_count, len(episode_ids) - 1)
+    val_episodes = {episode_ids[i] for i in perm[:val_episode_count]}
+    train_episodes = set(episode_ids) - val_episodes
+
+    train_indices = sorted(
+        sample_index
+        for episode_index in train_episodes
+        for sample_index in by_episode[episode_index]
+    )
+    val_indices = sorted(
+        sample_index
+        for episode_index in val_episodes
+        for sample_index in by_episode[episode_index]
+    )
+    if not train_indices or not val_indices:
+        raise ValueError(
+            "Episode-level split produced an empty subset: "
+            f"episodes={len(episode_ids)} validation_fraction={val_fraction}"
+        )
+
+    log.info(
+        "Episode-level split: train_episodes=%d val_episodes=%d train_samples=%d val_samples=%d",
+        len(train_episodes),
+        len(val_episodes),
+        len(train_indices),
+        len(val_indices),
+    )
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
 
 
 def _batch_size(batch: dict[str, Any]) -> int:
@@ -707,6 +785,9 @@ def run_bc(cfg: DictConfig) -> None:
     # Infer proprio state dim from a sample batch so we don't hardcode it.
     log.info("Loading sample to infer model dimensions")
     sample = dataset[0]
+    for k in sample.keys():
+        if "image" in k.lower():
+            print("!@!", k, sample[k].shape if hasattr(sample[k], 'shape') else type(sample[k]))
     state_dim = int(sample["observation.state"].shape[-1])
     action_dim = int(sample["action"].shape[-1])
     if action_dim != 8:
@@ -742,7 +823,7 @@ def run_bc(cfg: DictConfig) -> None:
         cfg.model.name,
         action_dim=action_dim,
         state_dim=state_dim,
-        image_keys=image_keys,
+        image_keys=cfg.task.adapter.image_keys,
         **OmegaConf.to_container(cfg.model.kwargs, resolve=True),
     )
     vla.to(device)

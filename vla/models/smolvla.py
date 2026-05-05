@@ -210,6 +210,12 @@ class SmolVLA(BaseVLA):
         # Tracks which step in the current action chunk we are (for inference).
         self._rel_base_state: torch.Tensor | None = None
         self._rel_step_in_chunk: int = 0
+        # Match bc_train's temporal observation delta_timestamps:
+        # images [-0.2, -0.1, 0.0], state [-0.1, 0.0].
+        self._image_obs_steps = 3
+        self._state_obs_steps = 2
+        self._image_history: dict[str, list[torch.Tensor]] = {}
+        self._state_history: list[torch.Tensor] = []
 
         # Defer LeRobot import so the package is optional at collection /
         # linting time and so import errors surface with useful context.
@@ -311,22 +317,34 @@ class SmolVLA(BaseVLA):
     ) -> torch.Tensor:
         """Rollout helper — returns a single-step action ``(B, A)``."""
         state_dev = state.to(self._device)
+        current_state = state_dev[:, -1].contiguous() if state_dev.ndim == 3 else state_dev
 
         if self.use_relative_actions:
             n_steps = getattr(self.cfg, "n_action_steps", 1) or 1
             if self._rel_step_in_chunk == 0:
                 # Capture state at the start of each planning chunk so all
                 # actions in the chunk are converted relative to the same origin.
-                self._rel_base_state = state_dev.clone()
+                self._rel_base_state = current_state.clone()
 
         observation: dict[str, Any] = {
-            "observation.state": state_dev,
+            "observation.state": self._stack_temporal_history(
+                self._state_history,
+                current_state,
+                self._state_obs_steps,
+            ),
             "task": list(task),
         }
         for k in self.image_keys:
             if k not in images:
                 raise KeyError(f"SmolVLA expects image key '{k}' — got {list(images)}")
-            observation[f"observation.images.{k}"] = images[k].to(self._device)
+            image = images[k].to(self._device)
+            current_image = image[:, -1].contiguous() if image.ndim == 5 else image
+            image_history = self._image_history.setdefault(k, [])
+            observation[f"observation.images.{k}"] = self._stack_temporal_history(
+                image_history,
+                current_image,
+                self._image_obs_steps,
+            )
 
         observation = self.preprocess_batch(observation)
         observation = self._move_to_device(observation)
@@ -352,6 +370,29 @@ class SmolVLA(BaseVLA):
             self.policy.reset()
         self._rel_base_state = None
         self._rel_step_in_chunk = 0
+        self._image_history.clear()
+        self._state_history.clear()
+
+    @staticmethod
+    def _stack_temporal_history(
+        history: list[torch.Tensor],
+        current: torch.Tensor,
+        steps: int,
+    ) -> torch.Tensor:
+        """Append current observation and return ``(B, steps, ...)`` history."""
+        if (
+            not history
+            or history[-1].shape != current.shape
+            or history[-1].dtype != current.dtype
+            or history[-1].device != current.device
+        ):
+            history[:] = [current.clone() for _ in range(steps)]
+        else:
+            history.append(current.clone())
+            del history[:-steps]
+            while len(history) < steps:
+                history.insert(0, history[0].clone())
+        return torch.stack(history[-steps:], dim=1)
 
     # ------------------------------------------------------------------
     # Relative-action helpers

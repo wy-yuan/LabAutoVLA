@@ -8,7 +8,7 @@
 Loads a trained VLA checkpoint and produces two diagnostic plots:
 
 1. offline_predict_test.png  — per-chunk-horizon analysis averaged over the
-   validation split (same 10 % holdout as bc_train).
+   episode-level validation split (same holdout policy as bc_train).
 
 2. sequence_loss.png — per-anchor action-chunk flow loss and step-0 L2 error plotted in
    temporal order over complete episodes from the FULL dataset (not the val
@@ -35,7 +35,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -63,14 +63,17 @@ def _load_datasets(cfg: DictConfig):
     """Return (full_dataset, val_subset, chunk_size).
 
     full_dataset — the complete LeRobotDataset (used for the sequence plot)
-    val_subset   — 10 % random split identical to bc_train's holdout
+    val_subset   — episode-level holdout identical to bc_train's split
     """
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
     except ImportError as exc:
         raise ImportError("pip install lerobot") from exc
 
-    from vla.training.bc_train import _ensure_local_episode_metadata
+    from vla.training.bc_train import (
+        _ensure_local_episode_metadata,
+        _split_train_val_dataset,
+    )
 
     root = Path(cfg.dataset.root)
     if not root.exists():
@@ -82,7 +85,15 @@ def _load_datasets(cfg: DictConfig):
 
     chunk_size = int(cfg.dataset.get("action_chunk_size", 50))
     fps = int(cfg.dataset.fps)
-    delta_timestamps = {"action": [i / fps for i in range(chunk_size)]}
+    image_keys = OmegaConf.to_container(cfg.task.adapter.image_keys, resolve=True)
+    delta_timestamps = {
+        **{
+            f"observation.images.{image_key}": [-0.2, -0.1, 0.0]
+            for image_key in image_keys
+        },
+        "observation.state": [-0.1, 0.0],
+        "action": [i / fps for i in range(chunk_size)],
+    }
 
     full_dataset = LeRobotDataset(
         repo_id=cfg.dataset.repo_id,
@@ -92,11 +103,11 @@ def _load_datasets(cfg: DictConfig):
 
     val_fraction = float(cfg.get("validation_fraction", 0.1))
     seed = int(cfg.get("split_seed", 42))
-    n = len(full_dataset)
-    n_val = max(1, int(round(n * val_fraction)))
-    n_train = n - n_val
-    generator = torch.Generator().manual_seed(seed)
-    _, val_ds = random_split(full_dataset, [n_train, n_val], generator=generator)
+    _, val_ds = _split_train_val_dataset(
+        full_dataset,
+        val_fraction=val_fraction,
+        seed=seed,
+    )
 
     return full_dataset, val_ds, chunk_size
 

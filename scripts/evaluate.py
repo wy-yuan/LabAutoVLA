@@ -170,7 +170,15 @@ def _ensure_action_normalization(cfg: DictConfig, vla: Any) -> None:
     fps = int(dataset_cfg.get("fps", 30))
     _ensure_local_episode_metadata(root, fps=fps)
     chunk_size = int(dataset_cfg.get("action_chunk_size", 1))
-    delta_timestamps = {"action": [i / fps for i in range(chunk_size)]}
+    image_keys = OmegaConf.to_container(cfg.task.adapter.image_keys, resolve=True)
+    delta_timestamps = {
+        **{
+            f"observation.images.{image_key}": [-0.2, -0.1, 0.0]
+            for image_key in image_keys
+        },
+        "observation.state": [-0.1, 0.0],
+        "action": [i / fps for i in range(chunk_size)],
+    }
     dataset = LeRobotDataset(
         repo_id=repo_id,
         root=root,
