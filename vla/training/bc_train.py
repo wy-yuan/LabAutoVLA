@@ -196,20 +196,12 @@ def _build_dataset(cfg: DictConfig):
     # makes LeRobot fall back to Hub metadata download. Repair locally first.
     _ensure_local_episode_metadata(root, fps=int(cfg.dataset.fps))
 
-    # delta_timestamps lets LeRobot serve action chunks aligned with
-    # SmolVLA's chunk_size; overridable per model via cfg.model.
+    # Only action needs temporal expansion here. SmolVLA consumes the current
+    # image/state; adding image/state histories just creates redundant tensors.
     delta_timestamps = None
     if cfg.dataset.get("action_chunk_size", None):
         k = int(cfg.dataset.action_chunk_size)
-        image_keys = OmegaConf.to_container(cfg.task.adapter.image_keys, resolve=True)
-        delta_timestamps = {
-            **{
-                f"observation.images.{image_key}": [-0.2, -0.1, 0.0]
-                for image_key in image_keys
-            },
-            "observation.state": [-0.1, 0.0],
-            "action": [i / cfg.dataset.fps for i in range(k)],
-        }
+        delta_timestamps = {"action": [i / cfg.dataset.fps for i in range(k)]}
 
     dataset = LeRobotDataset(
         repo_id=cfg.dataset.repo_id,
@@ -833,24 +825,6 @@ def run_bc(cfg: DictConfig) -> None:
         OmegaConf.to_container(cfg.model.kwargs, resolve=True).get("use_relative_actions", False)
     )
     use_relative = bool(getattr(vla, "use_relative_actions", requested_relative))
-    if not use_relative:
-        log.info("use_relative_actions=False; computing absolute action stats from dataset")
-        print("[bc_train] Computing absolute action normalization stats...", flush=True)
-        abs_stats = _compute_action_normalization_stats(
-            dataset,
-            use_relative_actions=False,
-            action_chunk_size=int(cfg.dataset.get("action_chunk_size", 1)),
-            batch_size=int(cfg.mode.batch_size) * 4,
-            num_workers=int(cfg.mode.num_workers),
-        )
-        log.info(
-            "Absolute action stats: mean=%s std=%s",
-            abs_stats["mean"].tolist(),
-            abs_stats["std"].tolist(),
-        )
-        vla.update_action_normalizer_stats(abs_stats["mean"], abs_stats["std"], mode="absolute")
-        print("[bc_train] Absolute action stats installed in policy normalizer.", flush=True)
-
     if use_relative:
         log.info("use_relative_actions=True — computing relative action stats from dataset")
         print("[bc_train] Computing relative action stats...", flush=True)
@@ -865,8 +839,16 @@ def run_bc(cfg: DictConfig) -> None:
             rel_stats["mean"].tolist(),
             rel_stats["std"].tolist(),
         )
-        vla.update_action_normalizer_stats(rel_stats["mean"], rel_stats["std"], mode="relative")
-        print("[bc_train] Relative action stats injected into policy normalizer.", flush=True)
+        vla.configure_processors(
+            dataset.meta.stats,
+            action_stats=rel_stats,
+            action_stats_mode="relative",
+        )
+        print("[bc_train] LeRobot processors configured with relative action stats.", flush=True)
+    else:
+        log.info("use_relative_actions=False; using LeRobot dataset.meta.stats for processors")
+        vla.configure_processors(dataset.meta.stats, action_stats_mode="absolute")
+        print("[bc_train] LeRobot processors configured from dataset.meta.stats.", flush=True)
 
     # -- Optim + Logger ------------------------------------------------
     optim = _build_optimizer(vla, cfg)

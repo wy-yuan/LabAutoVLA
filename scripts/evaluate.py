@@ -135,12 +135,14 @@ def _build_policy(cfg: DictConfig, obs: dict[str, Any], action_dim: int):
 
 
 def _ensure_action_normalization(cfg: DictConfig, vla: Any) -> None:
-    """Install action normalization stats for evaluation when a checkpoint lacks them."""
-    has_stats = getattr(vla, "has_action_normalizer_stats", None)
+    """Configure LeRobot processors from the dataset when checkpoint processors lack stats."""
+    has_stats = getattr(vla, "has_processor_stats", None)
+    if not callable(has_stats):
+        has_stats = getattr(vla, "has_action_normalizer_stats", None)
     if callable(has_stats) and has_stats():
         return
-    update_stats = getattr(vla, "update_action_normalizer_stats", None)
-    if not callable(update_stats):
+    configure_processors = getattr(vla, "configure_processors", None)
+    if not callable(configure_processors):
         return
 
     dataset_cfg = cfg.get("dataset", {})
@@ -170,15 +172,7 @@ def _ensure_action_normalization(cfg: DictConfig, vla: Any) -> None:
     fps = int(dataset_cfg.get("fps", 30))
     _ensure_local_episode_metadata(root, fps=fps)
     chunk_size = int(dataset_cfg.get("action_chunk_size", 1))
-    image_keys = OmegaConf.to_container(cfg.task.adapter.image_keys, resolve=True)
-    delta_timestamps = {
-        **{
-            f"observation.images.{image_key}": [-0.2, -0.1, 0.0]
-            for image_key in image_keys
-        },
-        "observation.state": [-0.1, 0.0],
-        "action": [i / fps for i in range(chunk_size)],
-    }
+    delta_timestamps = {"action": [i / fps for i in range(chunk_size)]}
     dataset = LeRobotDataset(
         repo_id=repo_id,
         root=root,
@@ -187,16 +181,22 @@ def _ensure_action_normalization(cfg: DictConfig, vla: Any) -> None:
 
     use_relative = bool(getattr(vla, "use_relative_actions", False))
     mode = "relative" if use_relative else "absolute"
-    stats = _compute_action_normalization_stats(
-        dataset,
-        use_relative_actions=use_relative,
-        action_chunk_size=chunk_size,
-        batch_size=int(dataset_cfg.get("stats_batch_size", 256)),
-        num_workers=int(dataset_cfg.get("stats_num_workers", 0)),
+    action_stats = None
+    if use_relative:
+        action_stats = _compute_action_normalization_stats(
+            dataset,
+            use_relative_actions=True,
+            action_chunk_size=chunk_size,
+            batch_size=int(dataset_cfg.get("stats_batch_size", 256)),
+            num_workers=int(dataset_cfg.get("stats_num_workers", 0)),
+        )
+    configure_processors(
+        dataset.meta.stats,
+        action_stats=action_stats,
+        action_stats_mode=mode,
     )
-    update_stats(stats["mean"], stats["std"], mode=mode)
     logging.getLogger(__name__).info(
-        "Installed %s action normalization stats from %s for evaluation",
+        "Configured LeRobot %s processors from %s for evaluation",
         mode,
         root,
     )

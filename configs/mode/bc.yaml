@@ -9,7 +9,7 @@ validation_fraction: 0.1
 split_seed: 42
 
 # Checkpointing / evaluation cadence
-ckpt_every: 5
+ckpt_every: 1
 eval_every: 5
 
 # Online sim evaluation — set false to skip spinning up Isaac Lab.

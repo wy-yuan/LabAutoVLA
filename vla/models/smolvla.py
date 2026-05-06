@@ -17,8 +17,8 @@ Why a thin wrapper rather than subclassing ``SmolVLAPolicy`` directly?
 
 from __future__ import annotations
 
-import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -28,8 +28,6 @@ from .base_vla import BaseVLA, VLAOutput
 from .registry import register_vla
 
 log = logging.getLogger(__name__)
-
-_ACTION_NORMALIZATION_FILE = "action_normalization.json"
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +178,50 @@ def action_to_env_action(action: torch.Tensor) -> torch.Tensor:
     return processed
 
 
+try:
+    from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+    from lerobot.processor import ProcessorStep, ProcessorStepRegistry
+    from lerobot.processor.core import TransitionKey
+    from lerobot.utils.constants import OBS_STATE
+
+    @dataclass
+    @ProcessorStepRegistry.register(name="labauto_relative_ee_action")
+    class RelativeEEActionProcessorStep(ProcessorStep):
+        """Convert absolute EE-pose actions to LabAuto's relative target space."""
+
+        state_key: str = OBS_STATE
+
+        def __call__(self, transition):
+            self._current_transition = transition.copy()
+            new_transition = self._current_transition
+            action = new_transition.get(TransitionKey.ACTION)
+            if action is None:
+                return new_transition
+            if not isinstance(action, torch.Tensor):
+                raise ValueError(f"Relative EE action expects a tensor action, got {type(action)}")
+
+            observation = new_transition.get(TransitionKey.OBSERVATION) or {}
+            state = observation.get(self.state_key)
+            if state is None:
+                raise ValueError(
+                    f"Relative action preprocessing requires '{self.state_key}' in the observation."
+                )
+            state = torch.as_tensor(state, device=action.device, dtype=action.dtype)
+            if state.ndim == 3:
+                state = state[:, -1]
+            new_transition[TransitionKey.ACTION] = actions_to_relative(action, state)
+            return new_transition
+
+        def transform_features(
+            self,
+            features: dict[PipelineFeatureType, dict[str, PolicyFeature]],
+        ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+            return features
+
+except (ImportError, ValueError):  # pragma: no cover - LeRobot may be absent during lightweight tooling.
+    RelativeEEActionProcessorStep = None  # type: ignore[assignment]
+
+
 @register_vla("smolvla")
 class SmolVLA(BaseVLA):
     """Thin adapter around ``lerobot.common.policies.smolvla.SmolVLAPolicy``."""
@@ -202,20 +244,16 @@ class SmolVLA(BaseVLA):
         device: str | torch.device = "cuda",
     ):
         super().__init__(action_dim=action_dim, state_dim=state_dim, image_keys=image_keys)
+        self._device = torch.device(device)
         self.use_relative_actions = use_relative_actions
         self.step0_loss_weight = step0_loss_weight
-        self._action_norm_mean: torch.Tensor | None = None
-        self._action_norm_std: torch.Tensor | None = None
         self._action_norm_mode = "relative" if self.use_relative_actions else "absolute"
+        self._processor_stats: dict[str, dict[str, Any]] = {}
+        self.preprocessor: Any | None = None
+        self.postprocessor: Any | None = None
         # Tracks which step in the current action chunk we are (for inference).
         self._rel_base_state: torch.Tensor | None = None
         self._rel_step_in_chunk: int = 0
-        # Match bc_train's temporal observation delta_timestamps:
-        # images [-0.2, -0.1, 0.0], state [-0.1, 0.0].
-        self._image_obs_steps = 3
-        self._state_obs_steps = 2
-        self._image_history: dict[str, list[torch.Tensor]] = {}
-        self._state_history: list[torch.Tensor] = []
 
         # Defer LeRobot import so the package is optional at collection /
         # linting time and so import errors surface with useful context.
@@ -242,6 +280,7 @@ class SmolVLA(BaseVLA):
         cfg_kwargs["freeze_vision_encoder"] = freeze_vision_encoder
         cfg_kwargs["train_expert_only"] = train_expert_only
         cfg_kwargs["load_vlm_weights"] = load_vlm_weights
+        cfg_kwargs["device"] = str(self._device)
         cfg_kwargs["input_features"] = {
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
             **{
@@ -267,9 +306,9 @@ class SmolVLA(BaseVLA):
         else:
             self.policy = SmolVLAPolicy(self.cfg)
 
-        self._device = torch.device(device)
         self.to(self._device)
-        self._load_action_normalizer_from_checkpoint(pretrained_name_or_path)
+        if not self._try_load_processors_from_checkpoint(pretrained_name_or_path):
+            self.configure_processors()
 
     # ------------------------------------------------------------------
     # Contract
@@ -277,9 +316,6 @@ class SmolVLA(BaseVLA):
     def compute_loss(self, batch: Mapping[str, Any]) -> VLAOutput:
         """Delegate to the underlying policy's forward-with-loss path."""
         batch = self._move_to_device(batch)
-        if self.use_relative_actions:
-            batch = self._batch_to_relative(batch)
-        batch = self._batch_to_normalized_action(batch)
         # LeRobot policies return either a dict (preferred) or a tuple
         # (loss, info). We normalise.
         result = self.policy.forward(batch)
@@ -327,11 +363,7 @@ class SmolVLA(BaseVLA):
                 self._rel_base_state = current_state.clone()
 
         observation: dict[str, Any] = {
-            "observation.state": self._stack_temporal_history(
-                self._state_history,
-                current_state,
-                self._state_obs_steps,
-            ),
+            "observation.state": current_state,
             "task": list(task),
         }
         for k in self.image_keys:
@@ -339,23 +371,17 @@ class SmolVLA(BaseVLA):
                 raise KeyError(f"SmolVLA expects image key '{k}' — got {list(images)}")
             image = images[k].to(self._device)
             current_image = image[:, -1].contiguous() if image.ndim == 5 else image
-            image_history = self._image_history.setdefault(k, [])
-            observation[f"observation.images.{k}"] = self._stack_temporal_history(
-                image_history,
-                current_image,
-                self._image_obs_steps,
-            )
+            observation[f"observation.images.{k}"] = current_image
 
         observation = self.preprocess_batch(observation)
-        observation = self._move_to_device(observation)
 
         # ``select_action`` streams one action per call out of the internal
         # chunk buffer; call ``reset()`` between episodes (see BaseVLA.reset).
         action = self.policy.select_action(observation)
-        action = self._unnormalize_action(action)
+        action = self.postprocess_action(action)
 
         if self.use_relative_actions and self._rel_base_state is not None:
-            action = actions_to_absolute(action, self._rel_base_state)
+            action = actions_to_absolute(action, self._rel_base_state.to(action.device))
             n_steps = getattr(self.cfg, "n_action_steps", 1) or 1
             self._rel_step_in_chunk = (self._rel_step_in_chunk + 1) % n_steps
 
@@ -370,29 +396,6 @@ class SmolVLA(BaseVLA):
             self.policy.reset()
         self._rel_base_state = None
         self._rel_step_in_chunk = 0
-        self._image_history.clear()
-        self._state_history.clear()
-
-    @staticmethod
-    def _stack_temporal_history(
-        history: list[torch.Tensor],
-        current: torch.Tensor,
-        steps: int,
-    ) -> torch.Tensor:
-        """Append current observation and return ``(B, steps, ...)`` history."""
-        if (
-            not history
-            or history[-1].shape != current.shape
-            or history[-1].dtype != current.dtype
-            or history[-1].device != current.device
-        ):
-            history[:] = [current.clone() for _ in range(steps)]
-        else:
-            history.append(current.clone())
-            del history[:-steps]
-            while len(history) < steps:
-                history.insert(0, history[0].clone())
-        return torch.stack(history[-steps:], dim=1)
 
     # ------------------------------------------------------------------
     # Relative-action helpers
@@ -412,44 +415,132 @@ class SmolVLA(BaseVLA):
             step0["action_is_pad"] = pad
         return step0
 
-    def _batch_to_relative(self, batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Convert the ``action`` field of a training batch to relative actions."""
-        processed = dict(batch)
-        state = batch.get("observation.state")
-        action = batch.get("action")
-        if state is None or action is None:
-            return processed
-        processed["action"] = actions_to_relative(action, state)
-        return processed
+    @staticmethod
+    def _copy_stats(stats: Mapping[str, Mapping[str, Any]] | None) -> dict[str, dict[str, Any]]:
+        copied: dict[str, dict[str, Any]] = {}
+        for key, feature_stats in (stats or {}).items():
+            copied[key] = {}
+            for stat_name, value in feature_stats.items():
+                if isinstance(value, torch.Tensor):
+                    copied[key][stat_name] = value.detach().cpu().clone()
+                elif hasattr(value, "copy"):
+                    copied[key][stat_name] = value.copy()
+                else:
+                    copied[key][stat_name] = value
+        return copied
 
-    def _batch_to_normalized_action(self, batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Normalize the ``action`` field with the installed action stats."""
-        processed = dict(batch)
-        action = batch.get("action")
-        if action is None:
-            return processed
-        processed["action"] = self._normalize_action(action)
-        return processed
+    @staticmethod
+    def _action_stats_from_mean_std(mean: torch.Tensor, std: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {
+            "mean": mean.detach().float().cpu().clone(),
+            "std": std.detach().float().cpu().clamp(min=1e-6).clone(),
+        }
 
-    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        """Map env/relative action units into model target units."""
-        if self._action_norm_mean is None or self._action_norm_std is None:
-            return action
-        mean = self._action_norm_mean.to(device=action.device, dtype=action.dtype)
-        std = self._action_norm_std.to(device=action.device, dtype=action.dtype)
-        return (action - mean) / std.clamp_min(1e-6)
+    def configure_processors(
+        self,
+        dataset_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        *,
+        action_stats: Mapping[str, Any] | None = None,
+        action_stats_mode: str | None = None,
+    ) -> None:
+        """Build LeRobot pre/postprocessors with dataset statistics.
 
-    def _unnormalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        """Map model output units back into env/relative action units."""
-        if self._action_norm_mean is None or self._action_norm_std is None:
-            return action
-        mean = self._action_norm_mean.to(device=action.device, dtype=action.dtype)
-        std = self._action_norm_std.to(device=action.device, dtype=action.dtype)
-        return action * std.clamp_min(1e-6) + mean
+        ``dataset_stats`` should normally be ``LeRobotDataset.meta.stats``.
+        For relative-action training, pass the same dataset stats with an
+        ``action_stats`` override computed in relative target space.
+        """
+        try:
+            from lerobot.policies.factory import make_pre_post_processors
+            from lerobot.processor import NormalizerProcessorStep
+            from lerobot.utils.constants import ACTION
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("SmolVLA processors require the `lerobot` package.") from exc
+
+        stats = self._copy_stats(dataset_stats)
+        if action_stats is not None:
+            stats[ACTION] = {
+                k: v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v
+                for k, v in action_stats.items()
+            }
+        if action_stats_mode is not None:
+            if action_stats_mode not in ("absolute", "relative"):
+                raise ValueError(f"Unsupported action normalization mode: {action_stats_mode!r}")
+            self._action_norm_mode = action_stats_mode
+
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            policy_cfg=self.cfg,
+            dataset_stats=stats or None,
+        )
+        if self.use_relative_actions:
+            if RelativeEEActionProcessorStep is None:
+                raise ImportError("Relative action preprocessing requires LeRobot processors.")
+            if not any(isinstance(step, RelativeEEActionProcessorStep) for step in self.preprocessor.steps):
+                steps = list(self.preprocessor.steps)
+                insert_at = next(
+                    (idx for idx, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep)),
+                    len(steps),
+                )
+                steps.insert(insert_at, RelativeEEActionProcessorStep())
+                self.preprocessor.steps = steps
+
+        self._processor_stats = stats
+
+    def _try_load_processors_from_checkpoint(self, pretrained_name_or_path: str | Path) -> bool:
+        """Load saved LeRobot processor pipelines from a local checkpoint, when present."""
+        ckpt_dir = Path(pretrained_name_or_path)
+        if ckpt_dir.suffix == ".safetensors":
+            ckpt_dir = ckpt_dir.parent
+        if not ckpt_dir.exists():
+            return False
+
+        try:
+            from lerobot.policies.factory import make_pre_post_processors
+            from lerobot.utils.constants import (
+                POLICY_POSTPROCESSOR_DEFAULT_NAME,
+                POLICY_PREPROCESSOR_DEFAULT_NAME,
+            )
+        except ImportError:
+            return False
+
+        pre_cfg = ckpt_dir / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+        post_cfg = ckpt_dir / f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+        if not pre_cfg.exists() or not post_cfg.exists():
+            return False
+
+        try:
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                policy_cfg=self.cfg,
+                pretrained_path=str(ckpt_dir),
+                preprocessor_overrides={
+                    "device_processor": {"device": str(self._device)},
+                },
+            )
+            self._processor_stats = {}
+            log.info("Loaded LeRobot processor pipelines from %s", ckpt_dir)
+            return True
+        except Exception as exc:
+            log.warning("Could not load LeRobot processors from %s: %s", ckpt_dir, exc)
+            return False
+
+    def has_processor_stats(self) -> bool:
+        """Return whether action normalization stats are available in processors."""
+        try:
+            from lerobot.utils.constants import ACTION
+        except ImportError:
+            ACTION = "action"
+
+        if {"mean", "std"}.issubset(self._processor_stats.get(ACTION, {})):
+            return True
+        for pipeline in (self.preprocessor, self.postprocessor):
+            for step in getattr(pipeline, "steps", []):
+                stats = getattr(step, "stats", None) or getattr(step, "_tensor_stats", None)
+                if isinstance(stats, dict) and {"mean", "std"}.issubset(stats.get(ACTION, {})):
+                    return True
+        return False
 
     def has_action_normalizer_stats(self) -> bool:
-        """Return whether explicit action normalization stats are installed."""
-        return self._action_norm_mean is not None and self._action_norm_std is not None
+        """Backward-compatible alias for callers that predate processor pipelines."""
+        return self.has_processor_stats()
 
     def update_action_normalizer_stats(
         self,
@@ -457,146 +548,67 @@ class SmolVLA(BaseVLA):
         std: torch.Tensor,
         mode: str | None = None,
     ) -> None:
-        """Install action stats used by this wrapper and LeRobot processors.
+        """Backward-compatible action-stat override.
 
-        The wrapper applies these stats explicitly before ``policy.forward``
-        and after ``policy.select_action``. We also mirror them into LeRobot's
-        config/buffers so checkpoints stay compatible with processor-based
-        tooling.
+        Prefer ``configure_processors(dataset.meta.stats, action_stats=...)`` so
+        state/image stats are preserved. This method keeps existing callers
+        working by rebuilding the LeRobot processors with an action override.
         """
-        try:
-            from lerobot.utils.constants import ACTION
-        except ImportError:
-            ACTION = "action"
-
-        dev = self._device
-        mean_d = mean.detach().float().to(dev)
-        std_d = std.detach().float().clamp(min=1e-6).to(dev)
-        self._action_norm_mean = mean_d.clone()
-        self._action_norm_std = std_d.clone()
         if mode is not None:
             if mode not in ("absolute", "relative"):
                 raise ValueError(f"Unsupported action normalization mode: {mode!r}")
             self._action_norm_mode = mode
-
-        # Update the config record so the stats persist with the checkpoint.
-        if hasattr(self.policy, "config") and self.policy.config is not None:
-            ds = getattr(self.policy.config, "dataset_stats", None) or {}
-            if not isinstance(ds, dict):
-                ds = {}
-            ds[ACTION] = {
-                "mean": mean_d.detach().cpu().tolist(),
-                "std": std_d.detach().cpu().tolist(),
-            }
-            try:
-                self.policy.config.dataset_stats = ds
-            except Exception:
-                pass
-
-        # Try to patch the normalizer module buffers directly.
-        # LeRobot stores stats as named buffers; walk candidate modules.
-        for attr in ("normalize_targets", "unnormalize_outputs"):
-            m = getattr(self.policy, attr, None)
-            if m is None:
-                continue
-            for _, submod in m.named_modules():
-                buffers = dict(submod.named_buffers(recurse=False))
-                for buf_name, buf in buffers.items():
-                    if buf is None:
-                        continue
-                    if "mean" in buf_name and buf.shape == mean_d.shape:
-                        submod._buffers[buf_name] = mean_d.clone()
-                    elif "std" in buf_name and buf.shape == std_d.shape:
-                        submod._buffers[buf_name] = std_d.clone()
-
-    def _load_action_normalizer_from_checkpoint(self, pretrained_name_or_path: str | Path) -> None:
-        """Load explicit action normalization stats saved by ``save_pretrained``."""
-        ckpt_dir = Path(pretrained_name_or_path)
-        if ckpt_dir.suffix == ".safetensors":
-            ckpt_dir = ckpt_dir.parent
-        stats_path = ckpt_dir / _ACTION_NORMALIZATION_FILE
-        if not stats_path.exists():
-            return
-
-        try:
-            payload = json.loads(stats_path.read_text(encoding="utf-8"))
-            mean = torch.tensor(payload["mean"], dtype=torch.float32)
-            std = torch.tensor(payload["std"], dtype=torch.float32)
-        except Exception as exc:
-            log.warning("Failed to load action normalization stats from %s: %s", stats_path, exc)
-            return
-
-        mode = str(payload.get("mode") or self._action_norm_mode)
-        if mode in ("absolute", "relative") and mode != self._action_norm_mode:
-            log.warning(
-                "Checkpoint action normalization mode is %s but config requested %s; "
-                "using checkpoint mode.",
-                mode,
-                self._action_norm_mode,
-            )
-            self.use_relative_actions = mode == "relative"
-            self._action_norm_mode = mode
-
-        self.update_action_normalizer_stats(mean, std, mode=mode)
-        log.info("Loaded %s action normalization stats from %s", mode, stats_path)
+        self.configure_processors(
+            self._processor_stats,
+            action_stats=self._action_stats_from_mean_std(mean, std),
+            action_stats_mode=self._action_norm_mode,
+        )
 
     # ------------------------------------------------------------------
     # Persistence (prefer HF-native IO so we get safetensors shards)
     # ------------------------------------------------------------------
     def preprocess_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Prepare language tokens and compatibility keys expected by LeRobot SmolVLA."""
-        try:
-            from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
-        except ImportError:
-            return batch
-
-        processed = dict(batch)
-
-        if OBS_LANGUAGE_TOKENS not in processed and "task" in processed:
-            task = processed["task"]
-            if isinstance(task, str):
-                task_list = [task]
-            else:
-                task_list = list(task)
-
-            task_list = [text if text.endswith("\n") else f"{text}\n" for text in task_list]
-            tokenized = self.policy.model.vlm_with_expert.processor.tokenizer(
-                task_list,
-                padding=self.cfg.pad_language_to,
-                padding_side="right",
-                max_length=self.cfg.tokenizer_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            processed[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"]
-            processed[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].to(torch.bool)
-
+        """Run the LeRobot SmolVLA preprocessor pipeline."""
+        processed = self.preprocessor(dict(batch)) if self.preprocessor is not None else dict(batch)
         if "actions_id_pad" not in processed and "action_is_pad" in processed:
             processed["actions_id_pad"] = processed["action_is_pad"].to(torch.bool)
         elif "actions_id_pad" in processed and isinstance(processed["actions_id_pad"], torch.Tensor):
             processed["actions_id_pad"] = processed["actions_id_pad"].to(torch.bool)
-
         return processed
+
+    def postprocess_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Run the LeRobot SmolVLA postprocessor pipeline."""
+        if self.postprocessor is None:
+            return action
+        return self.postprocessor(action)
 
     def save_pretrained(self, save_dir: str | Path) -> None:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         self.policy.save_pretrained(save_dir)
-        if self._action_norm_mean is not None and self._action_norm_std is not None:
-            payload = {
-                "mode": self._action_norm_mode,
-                "mean": self._action_norm_mean.detach().cpu().tolist(),
-                "std": self._action_norm_std.detach().cpu().tolist(),
-            }
-            (save_dir / _ACTION_NORMALIZATION_FILE).write_text(
-                json.dumps(payload, indent=2),
-                encoding="utf-8",
+        try:
+            from lerobot.utils.constants import (
+                POLICY_POSTPROCESSOR_DEFAULT_NAME,
+                POLICY_PREPROCESSOR_DEFAULT_NAME,
+            )
+        except ImportError:
+            return
+        if self.preprocessor is not None:
+            self.preprocessor.save_pretrained(
+                save_dir,
+                config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+            )
+        if self.postprocessor is not None:
+            self.postprocessor.save_pretrained(
+                save_dir,
+                config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
             )
 
     def load_pretrained(self, load_dir: str | Path, strict: bool = True) -> None:
         self.policy = self.policy.__class__.from_pretrained(load_dir, config=self.cfg)
         self.to(self._device)
-        self._load_action_normalizer_from_checkpoint(load_dir)
+        if not self._try_load_processors_from_checkpoint(load_dir):
+            self.configure_processors()
 
     # ------------------------------------------------------------------
     # Internal helpers

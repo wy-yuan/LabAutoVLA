@@ -19,7 +19,7 @@ dataset:
   root: data/datasets/pipetting_v2_ep50
   repo_id: local/pipetting_v2_ep50
   fps: 30
-  action_chunk_size: 80
+  action_chunk_size: 50
 
 # Where every output (ckpts, videos, TB logs) lands for this run.
 output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_${mode.name}
