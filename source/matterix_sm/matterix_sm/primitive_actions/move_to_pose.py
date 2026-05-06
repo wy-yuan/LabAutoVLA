@@ -16,6 +16,33 @@ from ..robot_action_spaces import ActionSpaceInfo
 from ..scene_data import SceneData
 
 
+def _quat_normalize(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Normalize quaternions in (w, x, y, z) format."""
+    return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def _quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Spherical interpolation between quaternions in (w, x, y, z) format."""
+    q0 = _quat_normalize(q0)
+    q1 = _quat_normalize(q1)
+
+    dot = (q0 * q1).sum(dim=-1, keepdim=True)
+    q1 = torch.where(dot < 0.0, -q1, q1)
+    dot = torch.abs(dot).clamp(0.0, 1.0)
+
+    t = t.unsqueeze(-1)
+    linear = _quat_normalize(q0 + t * (q1 - q0))
+
+    theta_0 = torch.acos(dot)
+    sin_theta_0 = torch.sin(theta_0).clamp_min(1e-6)
+    theta = theta_0 * t
+    s0 = torch.sin(theta_0 - theta) / sin_theta_0
+    s1 = torch.sin(theta) / sin_theta_0
+    spherical = _quat_normalize(s0 * q0 + s1 * q1)
+
+    return torch.where(dot > 0.9995, linear, spherical)
+
+
 @configclass
 class MoveToPoseCfg(PrimitiveActionCfg):
     """Configuration for MoveToPose action (move to target pose).
@@ -31,6 +58,8 @@ class MoveToPoseCfg(PrimitiveActionCfg):
         orientation_threshold: Orientation threshold for success (radians).
         settling_time: Time (in seconds) the robot must remain within threshold before success.
                       Prevents false positives from overshoots or oscillations.
+        interpolation_duration: Time (in seconds) used to ramp from the current EE pose to
+                      the target pose. A value of 0.0 preserves the old immediate-target behavior.
     """
 
     target_positions: torch.Tensor | None = None
@@ -38,6 +67,7 @@ class MoveToPoseCfg(PrimitiveActionCfg):
     position_threshold: float = 0.01  # 10mm tolerance
     orientation_threshold: float = 0.02  # ~1.15 degrees tolerance (realistic for IK)
     settling_time: float = 0.05  # 50ms default (tunable per task)
+    interpolation_duration: float = 0.0
 
 
 class MoveToPose(PrimitiveAction):
@@ -62,6 +92,7 @@ class MoveToPose(PrimitiveAction):
         position_threshold: float,
         orientation_threshold: float,
         settling_time: float = 0.05,
+        interpolation_duration: float = 0.0,
         action_space_info: ActionSpaceInfo | None = None,
     ):
         """
@@ -75,6 +106,7 @@ class MoveToPose(PrimitiveAction):
             position_threshold: Distance threshold for success (meters).
             orientation_threshold: Orientation threshold for success (radians).
             settling_time: Time (in seconds) the robot must remain within threshold before success.
+            interpolation_duration: Time in seconds to ramp the commanded pose from current to target.
             action_space_info: Optional action space metadata for mask creation.
         """
         super().__init__(agent_assets, timeout, action_space_info)
@@ -97,9 +129,12 @@ class MoveToPose(PrimitiveAction):
         self.position_threshold = position_threshold
         self.orientation_threshold = orientation_threshold
         self.settling_time = settling_time
+        self.interpolation_duration = interpolation_duration
 
         # Settling time tracking (initialized in set_execution_params)
         self.time_in_threshold = None
+        self._interp_start_positions_w = None
+        self._interp_start_orientations_w = None
 
         # Validate action_space_info at init (fail-fast)
         if self.action_space_info is None:
@@ -204,6 +239,27 @@ class MoveToPose(PrimitiveAction):
             self._targets_initialized = True
         timings["target_init"] = time.perf_counter() - init_start
 
+        # Optional command interpolation. The success check still uses the final
+        # target, while the IK command ramps smoothly toward that target.
+        command_positions_w = self.target_positions_w
+        command_orientations_w = self.target_orientations_w
+        if self.interpolation_duration > 0.0:
+            if self._interp_start_positions_w is None:
+                self._interp_start_positions_w = robot_data.ee_pos_w.to(self.device).clone()
+                self._interp_start_orientations_w = robot_data.ee_quat_w.to(self.device).clone()
+
+            alpha = ((self.time_elapsed - self.dt) / self.interpolation_duration).clamp(0.0, 1.0)
+            alpha_pos = alpha.unsqueeze(-1)
+            command_positions_w = (
+                self._interp_start_positions_w
+                + alpha_pos * (self.target_positions_w - self._interp_start_positions_w)
+            )
+            command_orientations_w = _quat_slerp(
+                self._interp_start_orientations_w,
+                self.target_orientations_w,
+                alpha,
+            )
+
         # Zero the pre-allocated action tensor (reuse memory)
         zero_start = time.perf_counter()
         self._action_tensor.zero_()
@@ -215,8 +271,8 @@ class MoveToPose(PrimitiveAction):
         target_positions_b, target_orientations_b = self._convert_world_to_base_frame(
             scene_data,
             self._asset_name,
-            self.target_positions_w,
-            self.target_orientations_w,
+            command_positions_w,
+            command_orientations_w,
         )
         timings["frame_conversion"] = time.perf_counter() - frame_convert_start
 
@@ -347,6 +403,9 @@ class MoveToPose(PrimitiveAction):
         if self._orientation_was_none:
             self.target_orientations_w = None
 
+        self._interp_start_positions_w = None
+        self._interp_start_orientations_w = None
+
     @classmethod
     def from_cfg(cls, cfg: MoveToPoseCfg):
         """Create MoveToPose action from configuration."""
@@ -358,5 +417,6 @@ class MoveToPose(PrimitiveAction):
             position_threshold=cfg.position_threshold,
             orientation_threshold=cfg.orientation_threshold,
             settling_time=cfg.settling_time,
+            interpolation_duration=cfg.interpolation_duration,
             action_space_info=cfg.action_space_info,
         )

@@ -53,6 +53,7 @@ class MoveRelative(MoveToPose):
         timeout: float = None,
         position_threshold: float = None,
         orientation_threshold: float = None,
+        interpolation_duration: float = 0.0,
         action_space_info: ActionSpaceInfo | None = None,
     ):
         """
@@ -65,6 +66,7 @@ class MoveRelative(MoveToPose):
             timeout: Max time (in seconds) before timeout.
             position_threshold: Distance threshold for success (meters).
             orientation_threshold: Orientation threshold for success (radians).
+            interpolation_duration: Time in seconds to ramp the commanded pose from current to target.
             action_space_info: Optional action space metadata for mask creation.
         """
         # Initialize parent with None for targets (will be set on first call)
@@ -75,6 +77,7 @@ class MoveRelative(MoveToPose):
             timeout=timeout,
             position_threshold=position_threshold,
             orientation_threshold=orientation_threshold,
+            interpolation_duration=interpolation_duration,
             action_space_info=action_space_info,
         )
 
@@ -161,6 +164,7 @@ class MoveRelative(MoveToPose):
 
     def _reset_impl(self, env_ids: torch.Tensor | None = None) -> None:
         """Reset target initialization flag when environments are reset."""
+        super()._reset_impl(env_ids)
         # Target needs to be recomputed relative to new EE pose after reset
         self._target_initialized = False
 
@@ -174,5 +178,6 @@ class MoveRelative(MoveToPose):
             timeout=cfg.timeout,
             position_threshold=cfg.position_threshold,
             orientation_threshold=cfg.orientation_threshold,
+            interpolation_duration=cfg.interpolation_duration,
             action_space_info=cfg.action_space_info,
         )

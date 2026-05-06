@@ -21,7 +21,14 @@ from ..robot_action_spaces import ActionSpaceInfo
 from .pick_object import PickObjectCfg
 
 
-def _relaxed_move_to_frame(object: str, frame: str, agent_assets, action_space_info) -> MoveToFrameCfg:
+def _relaxed_move_to_frame(
+    object: str,
+    frame: str,
+    agent_assets,
+    action_space_info,
+    interpolation_duration: float = 0.0,
+    position_noise_range: dict[str, tuple[float, float]] | None = None,
+) -> MoveToFrameCfg:
     """Create a MoveToFrameCfg with relaxed thresholds for pipetting tasks."""
     cfg = MoveToFrameCfg()
     cfg.object = object
@@ -30,6 +37,8 @@ def _relaxed_move_to_frame(object: str, frame: str, agent_assets, action_space_i
     cfg.action_space_info = action_space_info
     cfg.position_threshold = 0.02      # 20mm (default: 10mm)
     cfg.orientation_threshold = 0.1    # ~5.7° (default: ~1.15°)
+    cfg.interpolation_duration = interpolation_duration
+    cfg.position_noise_range = position_noise_range
     return cfg
 
 
@@ -64,6 +73,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
         aspirate_duration: Time (s) to hold at the source dip position. Default: 1.5.
         dispense_duration: Time (s) to hold at the target dip position. Default: 1.5.
         lift_height: Upward clearance (m) after each dip. Default: 0.08.
+        interpolation_duration: Time (s) to ramp each move primitive from current pose to target.
         action_space_info: Action space metadata for the robot. REQUIRED.
     """
 
@@ -81,6 +91,19 @@ class PipetteLiquidCfg(CompositionalActionCfg):
     dispense_duration: float = 1.5    # s — hold time to simulate dispensing
     lift_height: float = 0.15         # m — clearance height after each dip
 
+    interpolation_duration: float = 0.8  # s — time to ramp each move from current to target pose
+
+    pre_grasp_position_noise_range: dict[str, tuple[float, float]] | None = {
+        "x": (-0.01, 0.01),
+        "y": (-0.01, 0.01),
+        "z": (-0.07, 0.07),
+    }
+    post_grasp_position_noise_range: dict[str, tuple[float, float]] | None = {
+        "x": (-0.01, 0.01),
+        "y": (-0.01, 0.01),
+        "z": (-0.07, 0.07),
+    }
+
     def __post_init__(self):
         """Build the 9-step primitive action sequence after field initialisation."""
         super().__post_init__()
@@ -93,16 +116,20 @@ class PipetteLiquidCfg(CompositionalActionCfg):
             #     object=self.pipette,
             #     action_space_info=self.action_space_info,
             # ),
-             OpenGripperCfg(
-                # target_value=0.1, # open gripper to 20% for pick-up
-                agent_assets=self.agent_assets,
-                duration=0.2,
-                action_space_info=self.action_space_info,
-            ),
+             
             _relaxed_move_to_frame(
                 object=self.pipette,
                 frame="pre_grasp",
                 agent_assets=self.agent_assets,
+                action_space_info=self.action_space_info,
+                interpolation_duration=self.interpolation_duration,
+                position_noise_range=self.pre_grasp_position_noise_range,
+            ),
+
+            OpenGripperCfg(
+                # target_value=0.1, # open gripper to 20% for pick-up
+                agent_assets=self.agent_assets,
+                duration=0.2,
                 action_space_info=self.action_space_info,
             ),
 
@@ -111,6 +138,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 frame="grasp",
                 agent_assets=self.agent_assets,
                 action_space_info=self.action_space_info,
+                interpolation_duration=self.interpolation_duration,
             ),
             CloseGripperCfg(
                 agent_assets=self.agent_assets,
@@ -122,6 +150,8 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 frame="post_grasp",
                 agent_assets=self.agent_assets,
                 action_space_info=self.action_space_info,
+                interpolation_duration=self.interpolation_duration,
+                position_noise_range=self.post_grasp_position_noise_range,
             ),
 
             # ── Step 2: Move above source container ──────────────────────────
@@ -129,6 +159,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 object=self.source,
                 frame="liquid_approach",
                 agent_assets=self.agent_assets,
+                interpolation_duration=self.interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
 
@@ -137,6 +168,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 agent_assets=self.agent_assets,
                 position_offset=(0.0, 0.0, -self.aspirate_depth),
                 orientation_offset=None,
+                interpolation_duration=self.interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
 
@@ -153,6 +185,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 agent_assets=self.agent_assets,
                 position_offset=(0.0, 0.0, self.lift_height),
                 orientation_offset=None,
+                interpolation_duration=self.interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
 
@@ -161,6 +194,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 object=self.target,
                 frame="liquid_approach",
                 agent_assets=self.agent_assets,
+                interpolation_duration=self.interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
 
@@ -169,6 +203,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 agent_assets=self.agent_assets,
                 position_offset=(0.0, 0.0, -self.dispense_depth),
                 orientation_offset=None,
+                interpolation_duration=self.interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
 
@@ -184,6 +219,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
                 agent_assets=self.agent_assets,
                 position_offset=(0.0, 0.0, self.lift_height),
                 orientation_offset=None,
+                interpolation_duration=self.interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
         ]

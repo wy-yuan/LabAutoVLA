@@ -31,6 +31,7 @@ class MoveToFrameCfg(MoveToPoseCfg):
 
     object: str = MISSING
     frame: str = MISSING
+    position_noise_range: dict[str, tuple[float, float]] | None = None
 
 
 class MoveToFrame(MoveToPose):
@@ -50,6 +51,8 @@ class MoveToFrame(MoveToPose):
         timeout: float,
         position_threshold: float,
         orientation_threshold: float,
+        interpolation_duration: float = 0.0,
+        position_noise_range: dict[str, tuple[float, float]] | None = None,
         action_space_info: ActionSpaceInfo | None = None,
     ):
         """
@@ -60,6 +63,8 @@ class MoveToFrame(MoveToPose):
             timeout: Max time (in seconds) before timeout.
             position_threshold: Distance threshold for success (meters).
             orientation_threshold: Orientation threshold for success (radians).
+            interpolation_duration: Time in seconds to ramp the commanded pose from current to target.
+            position_noise_range: Optional per-axis uniform noise added once to the target frame.
             action_space_info: Optional action space metadata for mask creation.
         """
         # Initialize parent with None targets (will be set on first call)
@@ -70,12 +75,14 @@ class MoveToFrame(MoveToPose):
             timeout=timeout,
             position_threshold=position_threshold,
             orientation_threshold=orientation_threshold,
+            interpolation_duration=interpolation_duration,
             action_space_info=action_space_info,
         )
 
         # Store frame lookup info
         self.object = object
         self.frame = frame
+        self.position_noise_range = position_noise_range
         self._frame_initialized = False
 
     def _compute_action_impl(self, scene_data: SceneData, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -116,6 +123,16 @@ class MoveToFrame(MoveToPose):
             # Frames are already in world frame (transformed by Isaac Lab's FrameTransformer)
             grasp_pos_w = frame_pose.position.to(self.device)
             grasp_quat_w = frame_pose.orientation.to(self.device) if frame_pose.orientation is not None else None
+            if self.position_noise_range is not None:
+                ranges = torch.tensor(
+                    [self.position_noise_range.get(axis, (0.0, 0.0)) for axis in ("x", "y", "z")],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                noise = ranges[:, 0] + torch.rand((self.num_envs, 3), device=self.device) * (
+                    ranges[:, 1] - ranges[:, 0]
+                )
+                grasp_pos_w = grasp_pos_w + noise
 
             # Apply robot-specific grasp-to-EE offset: ^W T_ee = ^W T_g · ^g T_ee
             if self.action_space_info and self.action_space_info.grasp_to_ee_offset and grasp_quat_w is not None:
@@ -144,6 +161,7 @@ class MoveToFrame(MoveToPose):
 
     def _reset_impl(self, env_ids: torch.Tensor | None = None) -> None:
         """Reset frame initialization flag when environments are reset."""
+        super()._reset_impl(env_ids)
         # Frame needs to be re-queried after reset
         self._frame_initialized = False
 
@@ -157,5 +175,7 @@ class MoveToFrame(MoveToPose):
             timeout=cfg.timeout,
             position_threshold=cfg.position_threshold,
             orientation_threshold=cfg.orientation_threshold,
+            interpolation_duration=cfg.interpolation_duration,
+            position_noise_range=cfg.position_noise_range,
             action_space_info=cfg.action_space_info,
         )

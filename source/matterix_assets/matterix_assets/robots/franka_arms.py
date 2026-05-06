@@ -236,21 +236,29 @@ class FRANKA_PANDA_CFG(MatterixArticulationCfg):
                 ],
             },
         ),
-        "reset_franka_arm_pose": EventTerm(
-            func=franka_stack_events.set_default_joint_pose,
+        # "reset_franka_arm_pose": EventTerm(
+        #     func=franka_stack_events.set_default_joint_pose,
+        #     mode="reset",
+        #     params={
+        #         "default_pose": [
+        #             0.0444,
+        #             -0.1894,
+        #             -0.1107,
+        #             -2.5148,
+        #             0.0044,
+        #             2.3775,
+        #             0.6952,
+        #             0.0400,
+        #             0.0400,
+        #         ],
+        #     },
+        # ),
+        "randomize_robot_joints": EventTerm(
+            func=franka_stack_events.randomize_joint_by_gaussian_offset,
             mode="reset",
             params={
-                "default_pose": [
-                    0.0444,
-                    -0.1894,
-                    -0.1107,
-                    -2.5148,
-                    0.0044,
-                    2.3775,
-                    0.6952,
-                    0.0400,
-                    0.0400,
-                ],
+                "mean": 0.0,
+                "std": 0.05,
             },
         ),
     }

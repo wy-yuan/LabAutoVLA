@@ -66,9 +66,9 @@ class PIPETTE_1ML_INST_CFG(MatterixRigidObjectCfg):
     # }
     frames = {
         # Frames for picking up the pipette from its rack
-        "pre_grasp": OffsetCfg(pos=(0.0, 0.0, 0.3), rot=(0.707, 0.0, 0.0, 0.707)), # Top-down approach
+        "pre_grasp": OffsetCfg(pos=(0.0, 0.0, 0.25), rot=(0.707, 0.0, 0.0, 0.707)), # Top-down approach
         "grasp": OffsetCfg(pos=(0.0, 0.0, 0.08), rot=(0.707, 0.0, 0.0, 0.707)),         # grip centre (body origin)
-        "post_grasp": OffsetCfg(pos=(0.0, 0.0, 0.3), rot=(0.707, 0.0, 0.0, 0.707)), # initial test - Fingers point forward: (0.5, 0.5, -0.5, 0.5)
+        "post_grasp": OffsetCfg(pos=(0.0, 0.0, 0.25), rot=(0.707, 0.0, 0.0, 0.707)), # initial test - Fingers point forward: (0.5, 0.5, -0.5, 0.5)
         "tip_pre": (0.0, 0.0, -0.16),     # 2 cm above the tip
         "tip": (0.0, 0.0, -0.18),         # at the pipette tip
     }

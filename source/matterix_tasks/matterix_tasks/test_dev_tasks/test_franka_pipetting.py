@@ -310,6 +310,10 @@ class ObservationManagerCfg:
             func=mdp.camera_rgb,
             params={"sensor_name": "overhead_camera"},
         )
+        wrist_rgb = ObsTerm(
+            func=mdp.camera_rgb,
+            params={"sensor_name": "wrist_camera"},
+        )
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -388,6 +392,23 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
                 focus_distance=400.0,
                 horizontal_aperture=20.955,
                 clipping_range=(0.1, 20.0),
+            ),
+            width=224,
+            height=224,
+        ),
+        "wrist_camera": TiledCameraCfg(
+            prim_path="/World/envs/env_.*/Articulations_robot/panda_hand/WristCamera",
+            offset=TiledCameraCfg.OffsetCfg(
+                pos=(0.04, 0.0, 0.06),
+                rot=(-0.6963642, -0.1227878, 0.1227878, 0.6963642),  # euler [-90, -20, 0]
+                convention="ros",
+            ),
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=12.0,
+                focus_distance=400.0,
+                horizontal_aperture=20.955,
+                clipping_range=(0.01, 20.0),
             ),
             width=224,
             height=224,
