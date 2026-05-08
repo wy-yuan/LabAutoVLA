@@ -113,6 +113,13 @@ def _load_model(cfg: DictConfig, action_dim: int, state_dim: int, image_keys: li
 
     model_kwargs = dict(OmegaConf.to_container(cfg.model.get("kwargs", {}), resolve=True))
     model_kwargs["device"] = cfg.device
+    if cfg.model.name == "smolvla":
+        from vla.models.smolvla import learned_action_dim_from_raw
+
+        action_dim = learned_action_dim_from_raw(
+            action_dim,
+            use_rotation_6d=bool(model_kwargs.get("use_rotation_6d", True)),
+        )
     vla = build_vla(
         cfg.model.name,
         action_dim=action_dim,
@@ -165,6 +172,10 @@ def _action_mode_label(action_dim: int) -> str:
 
 
 def _action_dim_labels(action_dim: int) -> list[str]:
+    if action_dim == 10:
+        return ["x", "y", "z", "r6_0", "r6_1", "r6_2", "r6_3", "r6_4", "r6_5", "grip"]
+    if action_dim == 11:
+        return ["x", "y", "z", "r6_0", "r6_1", "r6_2", "r6_3", "r6_4", "r6_5", "grip_l", "grip_r"]
     if action_dim == 8:
         return ["x", "y", "z", "qw", "qx", "qy", "qz", "grip"]
     if action_dim == 9:
@@ -467,10 +478,12 @@ def main(cfg: DictConfig) -> None:
         mode = "relative" if use_relative else "absolute"
         log.info("Configuring LeRobot %s processors from offline dataset...", mode)
         action_stats = None
-        if use_relative:
+        use_rotation_6d = bool(getattr(vla, "use_rotation_6d", False))
+        if use_relative or use_rotation_6d:
             action_stats = _compute_action_normalization_stats(
                 full_dataset,
-                use_relative_actions=True,
+                use_relative_actions=use_relative,
+                use_rotation_6d=use_rotation_6d,
                 action_chunk_size=chunk_size,
                 batch_size=int(cfg.get("stats_batch_size", 256)),
                 num_workers=int(cfg.get("stats_num_workers", 0)),

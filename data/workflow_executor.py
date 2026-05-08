@@ -84,6 +84,10 @@ class WorkflowExecutor:
         """Whether a specific environment finished successfully."""
         return bool(self.state_machine.action_sequence_success[env_index].item())
 
+    def mark_failed(self, env_index: int) -> None:
+        """Mark one environment as failed so the state machine stops commanding it."""
+        self.state_machine.action_sequence_failure[env_index] = True
+
     def current_action_index(self, env_index: int = 0) -> int:
         """Current primitive action index for a specific environment."""
         return int(self.state_machine.current_action_idx[env_index].item())

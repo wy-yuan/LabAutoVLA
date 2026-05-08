@@ -62,6 +62,94 @@ def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     ], dim=-1)
 
 
+def _quat_to_matrix(q: torch.Tensor) -> torch.Tensor:
+    """Convert [..., 4] quaternions [w,x,y,z] to [..., 3, 3] matrices."""
+    q = _quat_normalize(q)
+    w, x, y, z = q.unbind(dim=-1)
+    two_s = 2.0
+    return torch.stack(
+        [
+            1 - two_s * (y * y + z * z),
+            two_s * (x * y - z * w),
+            two_s * (x * z + y * w),
+            two_s * (x * y + z * w),
+            1 - two_s * (x * x + z * z),
+            two_s * (y * z - x * w),
+            two_s * (x * z - y * w),
+            two_s * (y * z + x * w),
+            1 - two_s * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(q.shape[:-1] + (3, 3))
+
+
+def _matrix_to_quat(matrix: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Convert [..., 3, 3] rotation matrices to quaternions [w,x,y,z]."""
+    m00 = matrix[..., 0, 0]
+    m11 = matrix[..., 1, 1]
+    m22 = matrix[..., 2, 2]
+    qw = 0.5 * torch.sqrt((1.0 + m00 + m11 + m22).clamp_min(eps))
+    qx = torch.copysign(
+        0.5 * torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(eps)),
+        matrix[..., 2, 1] - matrix[..., 1, 2],
+    )
+    qy = torch.copysign(
+        0.5 * torch.sqrt((1.0 - m00 + m11 - m22).clamp_min(eps)),
+        matrix[..., 0, 2] - matrix[..., 2, 0],
+    )
+    qz = torch.copysign(
+        0.5 * torch.sqrt((1.0 - m00 - m11 + m22).clamp_min(eps)),
+        matrix[..., 1, 0] - matrix[..., 0, 1],
+    )
+    return _quat_normalize(torch.stack([qw, qx, qy, qz], dim=-1))
+
+
+def quat_to_rotation_6d(q: torch.Tensor) -> torch.Tensor:
+    """Convert [..., 4] quaternions to Zhou 6D rotation columns."""
+    matrix = _quat_to_matrix(q)
+    return torch.cat([matrix[..., :, 0], matrix[..., :, 1]], dim=-1)
+
+
+def rotation_6d_to_quat(d6: torch.Tensor) -> torch.Tensor:
+    """Convert Zhou 6D rotation columns to [..., 4] quaternions [w,x,y,z]."""
+    a1 = d6[..., 0:3]
+    a2 = d6[..., 3:6]
+    b1 = torch.nn.functional.normalize(a1, dim=-1, eps=1e-8)
+    b2 = torch.nn.functional.normalize(
+        a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1,
+        dim=-1,
+        eps=1e-8,
+    )
+    b3 = torch.cross(b1, b2, dim=-1)
+    matrix = torch.stack([b1, b2, b3], dim=-1)
+    return _matrix_to_quat(matrix)
+
+
+def action_quat_to_rotation_6d(action: torch.Tensor) -> torch.Tensor:
+    """Map raw pose actions [pos(3), quat(4), gripper...] to learned 6D actions."""
+    if action.shape[-1] < 7:
+        raise ValueError(f"Quaternion action must have at least 7 dims, got {action.shape[-1]}")
+    return torch.cat(
+        [action[..., :3], quat_to_rotation_6d(action[..., 3:7]), action[..., 7:]],
+        dim=-1,
+    )
+
+
+def action_rotation_6d_to_quat(action: torch.Tensor) -> torch.Tensor:
+    """Map learned 6D actions [pos(3), rot6(6), gripper...] back to raw pose actions."""
+    if action.shape[-1] < 9:
+        raise ValueError(f"6D rotation action must have at least 9 dims, got {action.shape[-1]}")
+    return torch.cat(
+        [action[..., :3], rotation_6d_to_quat(action[..., 3:9]), action[..., 9:]],
+        dim=-1,
+    )
+
+
+def learned_action_dim_from_raw(raw_action_dim: int, *, use_rotation_6d: bool = True) -> int:
+    """Return policy output dim for a raw [pos, quat, gripper...] action dim."""
+    return int(raw_action_dim) + 2 if use_rotation_6d else int(raw_action_dim)
+
+
 def _same_hemisphere(q: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     """Flip ``q`` if needed so it represents rotation near ``reference``."""
     dot = (q * reference).sum(dim=-1, keepdim=True)
@@ -164,7 +252,9 @@ def actions_to_absolute(actions: torch.Tensor, state: torch.Tensor) -> torch.Ten
 
 
 def action_to_env_action(action: torch.Tensor) -> torch.Tensor:
-    """Convert learned 8D base-frame action to the Matterix env command."""
+    """Convert base-frame policy action to the Matterix env command."""
+    if action.shape[-1] in (10, 11):
+        action = action_rotation_6d_to_quat(action)
     if action.shape[-1] != 8:
         return action
     processed = action.clone()
@@ -180,7 +270,7 @@ def action_to_env_action(action: torch.Tensor) -> torch.Tensor:
 
 try:
     from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-    from lerobot.processor import ProcessorStep, ProcessorStepRegistry
+    from lerobot.processor import ActionProcessorStep, ProcessorStep, ProcessorStepRegistry
     from lerobot.processor.core import TransitionKey
     from lerobot.utils.constants import OBS_STATE
 
@@ -218,8 +308,25 @@ try:
         ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
             return features
 
+    @dataclass
+    @ProcessorStepRegistry.register(name="labauto_quat_action_to_rotation_6d")
+    class QuaternionActionToRotation6DProcessorStep(ActionProcessorStep):
+        """Convert action quaternions to Zhou 6D before LeRobot normalization."""
+
+        def action(self, action):
+            if not isinstance(action, torch.Tensor):
+                raise ValueError(f"6D rotation preprocessing expects a tensor action, got {type(action)}")
+            return action_quat_to_rotation_6d(action)
+
+        def transform_features(
+            self,
+            features: dict[PipelineFeatureType, dict[str, PolicyFeature]],
+        ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+            return features
+
 except (ImportError, ValueError):  # pragma: no cover - LeRobot may be absent during lightweight tooling.
     RelativeEEActionProcessorStep = None  # type: ignore[assignment]
+    QuaternionActionToRotation6DProcessorStep = None  # type: ignore[assignment]
 
 
 @register_vla("smolvla")
@@ -240,12 +347,14 @@ class SmolVLA(BaseVLA):
         load_pretrained: bool = True,
         load_vlm_weights: bool = False,
         use_relative_actions: bool = False,
+        use_rotation_6d: bool = True,
         step0_loss_weight: float = 1.0,
         device: str | torch.device = "cuda",
     ):
         super().__init__(action_dim=action_dim, state_dim=state_dim, image_keys=image_keys)
         self._device = torch.device(device)
         self.use_relative_actions = use_relative_actions
+        self.use_rotation_6d = use_rotation_6d
         self.step0_loss_weight = step0_loss_weight
         self._action_norm_mode = "relative" if self.use_relative_actions else "absolute"
         self._processor_stats: dict[str, dict[str, Any]] = {}
@@ -483,6 +592,21 @@ class SmolVLA(BaseVLA):
                 steps.insert(insert_at, RelativeEEActionProcessorStep())
                 self.preprocessor.steps = steps
 
+        if self.use_rotation_6d:
+            if QuaternionActionToRotation6DProcessorStep is None:
+                raise ImportError("6D rotation preprocessing requires LeRobot processors.")
+            if not any(
+                isinstance(step, QuaternionActionToRotation6DProcessorStep)
+                for step in self.preprocessor.steps
+            ):
+                steps = list(self.preprocessor.steps)
+                insert_at = next(
+                    (idx for idx, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep)),
+                    len(steps),
+                )
+                steps.insert(insert_at, QuaternionActionToRotation6DProcessorStep())
+                self.preprocessor.steps = steps
+
         self._processor_stats = stats
 
     def _try_load_processors_from_checkpoint(self, pretrained_name_or_path: str | Path) -> bool:
@@ -578,9 +702,11 @@ class SmolVLA(BaseVLA):
 
     def postprocess_action(self, action: torch.Tensor) -> torch.Tensor:
         """Run the LeRobot SmolVLA postprocessor pipeline."""
-        if self.postprocessor is None:
-            return action
-        return self.postprocessor(action)
+        if self.postprocessor is not None:
+            action = self.postprocessor(action)
+        if self.use_rotation_6d and action.shape[-1] in (10, 11):
+            action = action_rotation_6d_to_quat(action)
+        return action
 
     def save_pretrained(self, save_dir: str | Path) -> None:
         save_dir = Path(save_dir)

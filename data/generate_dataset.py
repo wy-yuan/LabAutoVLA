@@ -37,6 +37,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from vla.data.obs_adapter import ObsAdapterConfig
 from vla.data.task_language import TaskLanguageTemplate
 
 from data.hdf5_to_lerobot import convert as convert_hdf5_to_lerobot
@@ -216,6 +217,56 @@ def create_language_generators(
     return generators
 
 
+def _adapter_cfg_from_task_spec(task_spec: TaskSpec) -> ObsAdapterConfig:
+    """Build the VLA observation adapter declared by a task config."""
+    adapter = task_spec.cfg.get("adapter")
+    if adapter is None:
+        log.warning("Task %s has no adapter config. Using default overhead-only adapter.", task_spec.alias)
+        return ObsAdapterConfig()
+
+    adapter_dict = OmegaConf.to_container(adapter, resolve=True)
+    if not isinstance(adapter_dict, dict):
+        raise TypeError(f"Task {task_spec.alias} adapter config must be a mapping.")
+
+    default_cfg = ObsAdapterConfig()
+    image_keys = dict(adapter_dict.get("image_keys", default_cfg.image_keys))
+    state_keys = list(adapter_dict.get("state_keys", default_cfg.state_keys))
+    image_size = tuple(adapter_dict.get("image_size", default_cfg.image_size))
+
+    if len(image_size) != 2:
+        raise ValueError(f"Task {task_spec.alias} adapter.image_size must be [height, width].")
+    if not image_keys:
+        raise ValueError(f"Task {task_spec.alias} adapter.image_keys must contain at least one camera.")
+
+    return ObsAdapterConfig(
+        image_keys=image_keys,
+        state_keys=state_keys,
+        image_size=(int(image_size[0]), int(image_size[1])),
+    )
+
+
+def resolve_adapter_cfg(cfg: DictConfig) -> ObsAdapterConfig:
+    """Resolve the single LeRobot schema adapter for the selected tasks."""
+    task_specs = resolve_task_specs(cfg, cfg.generation.tasks)
+    adapters = {
+        task_alias: _adapter_cfg_from_task_spec(task_spec)
+        for task_alias, task_spec in task_specs.items()
+    }
+
+    first_alias = str(cfg.generation.tasks[0])
+    first_adapter = adapters[first_alias]
+    for task_alias, adapter in adapters.items():
+        if adapter != first_adapter:
+            raise ValueError(
+                "All tasks in one LeRobot dataset must use the same adapter schema. "
+                f"Task '{first_alias}' uses {first_adapter}, but task '{task_alias}' uses {adapter}."
+            )
+
+    log.info("LeRobot adapter image keys: %s", first_adapter.image_keys)
+    log.info("LeRobot adapter state keys: %s", first_adapter.state_keys)
+    return first_adapter
+
+
 def create_task_runtimes(
     cfg: DictConfig,
     task_aliases: list[str],
@@ -266,29 +317,29 @@ def create_task_runtimes(
     return task_runtimes
 
 
-def _env0_done(done_flag: Any) -> bool:
-    """Return done status for environment index 0 from tensor/array/scalar flags."""
+def _env_done(done_flag: Any, env_index: int) -> bool:
+    """Return done status for one environment from tensor/array/scalar flags."""
     if isinstance(done_flag, torch.Tensor):
         if done_flag.ndim == 0:
             return bool(done_flag.item())
-        return bool(done_flag[0].item())
+        return bool(done_flag[env_index].item())
     if isinstance(done_flag, np.ndarray):
         if done_flag.ndim == 0:
             return bool(done_flag.item())
-        return bool(done_flag[0])
+        return bool(done_flag[env_index])
     return bool(done_flag)
 
 
-def _extract_env0_tree(value: Any) -> Any:
-    """Extract env-0 from nested observation trees."""
+def _extract_env_tree(value: Any, env_index: int) -> Any:
+    """Extract one env from nested observation trees."""
     if isinstance(value, dict):
-        return {key: _extract_env0_tree(sub_value) for key, sub_value in value.items()}
+        return {key: _extract_env_tree(sub_value, env_index) for key, sub_value in value.items()}
     if isinstance(value, torch.Tensor):
         tensor = value.detach().cpu()
-        return tensor[0].clone() if tensor.ndim > 0 else tensor.clone()
+        return tensor[env_index].clone() if tensor.ndim > 0 else tensor.clone()
     if isinstance(value, np.ndarray):
         array = np.asarray(value)
-        return np.array(array[0], copy=True) if array.ndim > 0 else np.array(array, copy=True)
+        return np.array(array[env_index], copy=True) if array.ndim > 0 else np.array(array, copy=True)
     return np.asarray(value)
 
 
@@ -327,8 +378,8 @@ def _extract_proprio(obs: dict[str, Any], state_keys: list[str]) -> torch.Tensor
     return torch.cat(parts, dim=0)
 
 
-def _extract_next_ee_action_base(obs: dict[str, Any]) -> torch.Tensor:
-    """Return achieved next EE pose in the env's 8D base-frame action layout.
+def _extract_next_ee_actions_base(obs: dict[str, Any]) -> torch.Tensor:
+    """Return achieved next EE poses in the env's 8D base-frame action layout.
 
     The current pipetting robot base is fixed at the world origin, so world EE
     pose and base-frame EE pose are equivalent.
@@ -344,7 +395,7 @@ def _extract_next_ee_action_base(obs: dict[str, Any]) -> torch.Tensor:
         finger_pos.abs().clamp(0.0, 0.04).mean(dim=-1, keepdim=True) / 0.04
     )
 
-    return torch.cat([ee_pos_w, ee_quat_w, gripper_open], dim=-1)[0].detach().cpu().float()
+    return torch.cat([ee_pos_w, ee_quat_w, gripper_open], dim=-1).detach().cpu().float()
 
 
 def _stack_tree(values: list[Any]) -> Any:
@@ -389,8 +440,8 @@ def execute_episode(
     cfg: DictConfig,
     max_steps: int | None = None,
     proprio_keys: list[str] | None = None,
-) -> dict[str, Any]:
-    """Execute a single episode and return raw HDF5-ready observations/actions.
+) -> list[dict[str, Any]]:
+    """Execute vectorized episodes and return one HDF5-ready demo per env.
 
     Actions are recorded as the achieved next EE pose in robot base frame,
     plus achieved gripper opening. This gives dense 8D targets matching the
@@ -402,48 +453,69 @@ def execute_episode(
     if proprio_keys is None:
         proprio_keys = _DEFAULT_PROPRIO_KEYS
 
-    raw_obs_steps: list[dict[str, Any]] = []
-    raw_action_steps: list[torch.Tensor] = []
+    num_envs = int(env.num_envs)
+    raw_obs_steps: list[list[dict[str, Any]]] = [[] for _ in range(num_envs)]
+    raw_action_steps: list[list[torch.Tensor]] = [[] for _ in range(num_envs)]
+    finished = [False] * num_envs
+    successes = [False] * num_envs
     obs, _ = env.reset()
 
-    success = False
     workflow_executor.reset()
 
     for _ in range(max_steps):
-        raw_obs_steps.append(_drop_recorded_robot_root_pose(_extract_env0_tree(obs)))
+        active_envs = [env_idx for env_idx, done in enumerate(finished) if not done]
+        if not active_envs:
+            break
+
+        for env_idx in active_envs:
+            raw_obs_steps[env_idx].append(
+                _drop_recorded_robot_root_pose(_extract_env_tree(obs, env_idx))
+            )
 
         action_tensor = workflow_executor.step(obs)
         obs, _, terminated, truncated, _ = env.step(action_tensor)
+        next_actions = _extract_next_ee_actions_base(obs)
 
-        # Record where the robot actually ended up after this step. Using the
-        # state machine's goal directly produces constant actions per primitive.
-        raw_action_steps.append(_extract_next_ee_action_base(obs))
+        for env_idx in active_envs:
+            # Record where the robot actually ended up after this step. Using the
+            # state machine's goal directly produces constant actions per primitive.
+            raw_action_steps[env_idx].append(next_actions[env_idx])
 
-        workflow_done = workflow_executor.is_done(env_index=0)
-        env_done = _env0_done(terminated) or _env0_done(truncated)
-        if workflow_done or env_done:
-            success = workflow_executor.succeeded(env_index=0)
-            break
+            workflow_done = workflow_executor.is_done(env_index=env_idx)
+            env_done = _env_done(terminated, env_idx) or _env_done(truncated, env_idx)
+            if workflow_done or env_done:
+                if env_done and not workflow_done:
+                    workflow_executor.mark_failed(env_idx)
+                finished[env_idx] = True
+                successes[env_idx] = workflow_executor.succeeded(env_index=env_idx)
 
-    if not raw_action_steps:
+    if not any(raw_action_steps):
         raise RuntimeError(f"Episode for task {task_id} produced no steps.")
 
-    if not success:
-        log.warning(
-            "Episode ended without workflow success. task=%s, action_idx=%s, max_steps=%s",
-            task_id,
-            workflow_executor.current_action_index(0),
-            max_steps,
-        )
+    episodes: list[dict[str, Any]] = []
+    for env_idx in range(num_envs):
+        if not raw_action_steps[env_idx]:
+            continue
+        if not successes[env_idx]:
+            log.warning(
+                "Episode ended without workflow success. task=%s, env=%d, action_idx=%s, max_steps=%s",
+                task_id,
+                env_idx,
+                workflow_executor.current_action_index(env_idx),
+                max_steps,
+            )
 
-    return {
-        "observations": _stack_tree(raw_obs_steps),
-        "actions": torch.stack(raw_action_steps, dim=0),
-        "success": success,
-        "length": len(raw_action_steps),
-        "task_id": task_id,
-        "task_prompt": task_prompt,
-    }
+        episodes.append({
+            "observations": _stack_tree(raw_obs_steps[env_idx]),
+            "actions": torch.stack(raw_action_steps[env_idx], dim=0),
+            "success": successes[env_idx],
+            "length": len(raw_action_steps[env_idx]),
+            "task_id": task_id,
+            "task_prompt": task_prompt,
+            "env_index": env_idx,
+        })
+
+    return episodes
 
 
 def determine_episodes_per_task(cfg: DictConfig) -> dict[str, int]:
@@ -495,6 +567,8 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
         while sum(episodes_collected.values()) < cfg.generation.num_episodes:
             task_alias = task_queue[task_idx % len(task_queue)]
             task_idx += 1
+            if episodes_collected[task_alias] >= episodes_per_task[task_alias]:
+                continue
 
             runtime = task_runtimes[task_alias]
             env = runtime["env"]
@@ -510,7 +584,7 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
             ) if "adapter" in task_spec.cfg and "state_keys" in task_spec.cfg.adapter else None
 
             try:
-                episode_data = execute_episode(
+                episode_batch = execute_episode(
                     env=env,
                     workflow_executor=workflow_executor,
                     task_id=task_id,
@@ -519,19 +593,29 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
                     proprio_keys=proprio_keys,
                 )
 
-                if cfg.generation.only_successful and not episode_data["success"]:
+                saved_this_rollout = 0
+                for episode_data in episode_batch:
+                    if episodes_collected[task_alias] >= episodes_per_task[task_alias]:
+                        break
+                    if sum(episodes_collected.values()) >= cfg.generation.num_episodes:
+                        break
+                    if cfg.generation.only_successful and not episode_data["success"]:
+                        continue
+
+                    hdf5_writers[task_alias].add_episode(
+                        observations=episode_data["observations"],
+                        actions=episode_data["actions"],
+                        task=episode_data["task_prompt"],
+                        task_id=task_id,
+                        success=episode_data["success"],
+                    )
+
+                    episodes_collected[task_alias] += 1
+                    saved_this_rollout += 1
+                    pbar.update(1)
+
+                if saved_this_rollout == 0:
                     continue
-
-                hdf5_writers[task_alias].add_episode(
-                    observations=episode_data["observations"],
-                    actions=episode_data["actions"],
-                    task=episode_data["task_prompt"],
-                    task_id=task_id,
-                    success=episode_data["success"],
-                )
-
-                episodes_collected[task_alias] += 1
-                pbar.update(1)
 
                 if sum(episodes_collected.values()) % cfg.logging.progress_interval == 0:
                     log.info("Episodes collected: %s", episodes_collected)
@@ -559,6 +643,7 @@ def write_generation_metadata(
         return
 
     task_specs = resolve_task_specs(cfg, cfg.generation.tasks)
+    adapter_cfg = resolve_adapter_cfg(cfg)
     metadata = {
         "dataset_name": layout.dataset_name,
         "hdf5_paths": {task_alias: str(path) for task_alias, path in layout.hdf5_paths.items()},
@@ -573,6 +658,11 @@ def write_generation_metadata(
         "video_codec": str(cfg.output.video_codec),
         "video_crf": int(cfg.output.video_crf),
         "use_videos": bool(cfg.output.use_videos),
+        "adapter": {
+            "image_keys": adapter_cfg.image_keys,
+            "state_keys": adapter_cfg.state_keys,
+            "image_size": list(adapter_cfg.image_size),
+        },
     }
 
     metadata_path = layout.lerobot_dir / "generation_metadata.json"
@@ -588,15 +678,18 @@ def convert_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> Path:
         raise FileNotFoundError(f"Missing HDF5 files for conversion: {missing_str}")
 
     repo_id = cfg.output.get("repo_id") or f"local/{layout.dataset_name}"
+    adapter_cfg = resolve_adapter_cfg(cfg)
     return convert_hdf5_to_lerobot(
         src=src_paths,
         dst=layout.lerobot_dir,
         task=None,
         fps=cfg.output.fps,
         repo_id=repo_id,
+        adapter_cfg=adapter_cfg,
         use_videos=cfg.output.use_videos,
         vcodec=cfg.output.video_codec,
         video_crf=int(cfg.output.video_crf),
+        frames_per_chunk=int(cfg.output.get("frames_per_chunk", 64)),
         overwrite=bool(cfg.output.get("overwrite_lerobot", False)),
     )
 

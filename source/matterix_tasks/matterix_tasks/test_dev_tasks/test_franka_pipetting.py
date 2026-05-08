@@ -23,6 +23,7 @@ import isaaclab.envs.mdp as isaaclab_mdp
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.sim import RenderCfg, SimulationCfg
+from isaaclab.sim.views import XformPrimView
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -42,6 +43,31 @@ def _resolve_env_ids(env, env_ids):
     if not isinstance(env_ids, torch.Tensor):
         return torch.as_tensor(env_ids, dtype=torch.long, device=env.device).flatten()
     return env_ids.to(device=env.device, dtype=torch.long).flatten()
+
+
+def _get_synced_static_view(env, asset_name, env_ids):
+    """Return a static-object view whose prim list covers the requested env ids."""
+    view = env.scene[asset_name]
+    if len(env_ids) == 0:
+        return view
+
+    required_count = int(torch.max(env_ids).item()) + 1
+    if getattr(view, "count", 0) >= required_count:
+        return view
+
+    asset_cfg = getattr(env.cfg.scene, asset_name, None)
+    prim_path = getattr(asset_cfg, "prim_path", None) or getattr(view, "_prim_path", None)
+    if prim_path is None:
+        raise RuntimeError(f"Cannot refresh static view for '{asset_name}': missing prim path.")
+
+    refreshed_view = XformPrimView(prim_path, device=env.device, stage=env.scene.stage)
+    if refreshed_view.count < required_count:
+        raise RuntimeError(
+            f"Static object '{asset_name}' only matched {refreshed_view.count} prim(s), "
+            f"but env id {required_count - 1} was requested. Check that it is cloned into every env."
+        )
+    env.scene.extras[asset_name] = refreshed_view
+    return refreshed_view
 
 
 def reset_source_fluid_to_beaker(env, env_ids):
@@ -70,7 +96,7 @@ def reset_randomize_pipette_rack(env, env_ids, pose_range, rack_name="pipette_ra
 
     env_ids = _resolve_env_ids(env, env_ids)
 
-    rack = env.scene[rack_name]
+    rack = _get_synced_static_view(env, rack_name, env_ids)
     rack_cfg = env.cfg.objects[rack_name]
     default_pos = torch.tensor(rack_cfg.init_state.pos, dtype=torch.float32, device=env.device)
     default_quat = torch.tensor(rack_cfg.init_state.rot, dtype=torch.float32, device=env.device)
@@ -98,7 +124,7 @@ def reset_pipette_to_pipette_rack(env, env_ids, rack_name="pipette_rack", pipett
 
     env_ids = _resolve_env_ids(env, env_ids)
 
-    rack = env.scene[rack_name]
+    rack = _get_synced_static_view(env, rack_name, env_ids)
     pipette = env.scene[pipette_name]
     rack_cfg = env.cfg.objects[rack_name]
     pipette_cfg = env.cfg.objects[pipette_name]

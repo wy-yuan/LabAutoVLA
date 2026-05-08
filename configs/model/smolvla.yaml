@@ -9,7 +9,8 @@ kwargs:
   # pretrained_name_or_path: outputs/20260429_204038_smolvla_bc/ckpt_epoch0030
   chunk_size: 50             # null -> use SmolVLA default
   n_action_steps: 10
-  use_relative_actions: False
+  use_rotation_6d: true      # raw data/env use xyz+quat(+gripper); model learns xyz+rot6(+gripper)
+  use_relative_actions: true
   step0_loss_weight: 1.0   # extra weight on step-0; 1.0 = disabled
   freeze_vision_encoder: false
   train_expert_only: false

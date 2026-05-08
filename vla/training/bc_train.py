@@ -241,6 +241,7 @@ def _compute_action_stats_from_lerobot_parquet(
     dataset,
     *,
     use_relative_actions: bool,
+    use_rotation_6d: bool,
     action_chunk_size: int | None,
 ) -> dict[str, torch.Tensor] | None:
     """Fast path for local LeRobot datasets that avoids decoding videos."""
@@ -256,7 +257,7 @@ def _compute_action_stats_from_lerobot_parquet(
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from vla.models.smolvla import actions_to_relative
+        from vla.models.smolvla import action_quat_to_rotation_6d, actions_to_relative
     except ImportError:
         return None
 
@@ -287,6 +288,8 @@ def _compute_action_stats_from_lerobot_parquet(
             if use_relative_actions:
                 horizon_states = ep_states[:n_valid]
                 horizon_actions = actions_to_relative(horizon_actions, horizon_states)
+            if use_rotation_6d:
+                horizon_actions = action_quat_to_rotation_6d(horizon_actions)
             targets.append(horizon_actions)
 
     if not targets:
@@ -306,6 +309,7 @@ def _compute_action_normalization_stats(
     dataset,
     *,
     use_relative_actions: bool,
+    use_rotation_6d: bool = False,
     action_chunk_size: int | None = None,
     batch_size: int = 256,
     num_workers: int = 0,
@@ -321,13 +325,14 @@ def _compute_action_normalization_stats(
     parquet_stats = _compute_action_stats_from_lerobot_parquet(
         dataset,
         use_relative_actions=use_relative_actions,
+        use_rotation_6d=use_rotation_6d,
         action_chunk_size=action_chunk_size,
     )
     if parquet_stats is not None:
         return parquet_stats
 
     from torch.utils.data import DataLoader
-    from vla.models.smolvla import actions_to_relative
+    from vla.models.smolvla import action_quat_to_rotation_6d, actions_to_relative
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     chunks: list[torch.Tensor] = []
@@ -337,6 +342,8 @@ def _compute_action_normalization_stats(
         if use_relative_actions:
             state = batch["observation.state"]   # (B, state_dim)
             target = actions_to_relative(target, state.float())
+        if use_rotation_6d:
+            target = action_quat_to_rotation_6d(target)
 
         if target.ndim == 3:
             valid = _valid_action_rows(batch, target)
@@ -365,6 +372,7 @@ def _compute_relative_action_stats(
     return _compute_action_normalization_stats(
         dataset,
         use_relative_actions=True,
+        use_rotation_6d=False,
         action_chunk_size=action_chunk_size,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -781,12 +789,12 @@ def run_bc(cfg: DictConfig) -> None:
         if "image" in k.lower():
             print("!@!", k, sample[k].shape if hasattr(sample[k], 'shape') else type(sample[k]))
     state_dim = int(sample["observation.state"].shape[-1])
-    action_dim = int(sample["action"].shape[-1])
-    if action_dim != 8:
+    raw_action_dim = int(sample["action"].shape[-1])
+    if raw_action_dim != 8:
         raise ValueError(
             "Expected 8D base-frame actions "
             "[ee_pos_base(3), ee_quat_base(4), gripper_open(1)], "
-            f"but dataset action_dim={action_dim}. Regenerate/reconvert the dataset "
+            f"but dataset action_dim={raw_action_dim}. Regenerate/reconvert the dataset "
             "with data.generate_dataset after the base-frame action patch."
         )
     if state_dim != 9:
@@ -802,10 +810,23 @@ def run_bc(cfg: DictConfig) -> None:
         if k.startswith("observation.images.")
     ]
 
+    model_kwargs = OmegaConf.to_container(cfg.model.kwargs, resolve=True)
+    use_rotation_6d_cfg = bool(model_kwargs.get("use_rotation_6d", True))
+    if cfg.model.name == "smolvla":
+        from vla.models.smolvla import learned_action_dim_from_raw
+
+        action_dim = learned_action_dim_from_raw(
+            raw_action_dim,
+            use_rotation_6d=use_rotation_6d_cfg,
+        )
+    else:
+        action_dim = raw_action_dim
+
     log.info(
-        "Building VLA model name=%s state_dim=%d action_dim=%d image_keys=%s",
+        "Building VLA model name=%s state_dim=%d raw_action_dim=%d model_action_dim=%d image_keys=%s",
         cfg.model.name,
         state_dim,
+        raw_action_dim,
         action_dim,
         image_keys,
     )
@@ -816,35 +837,42 @@ def run_bc(cfg: DictConfig) -> None:
         action_dim=action_dim,
         state_dim=state_dim,
         image_keys=cfg.task.adapter.image_keys,
-        **OmegaConf.to_container(cfg.model.kwargs, resolve=True),
+        **model_kwargs,
     )
     vla.to(device)
     log.info("Model ready on device=%s", device)
 
-    requested_relative = bool(
-        OmegaConf.to_container(cfg.model.kwargs, resolve=True).get("use_relative_actions", False)
-    )
+    requested_relative = bool(model_kwargs.get("use_relative_actions", False))
     use_relative = bool(getattr(vla, "use_relative_actions", requested_relative))
-    if use_relative:
-        log.info("use_relative_actions=True — computing relative action stats from dataset")
-        print("[bc_train] Computing relative action stats...", flush=True)
-        rel_stats = _compute_relative_action_stats(
+    use_rotation_6d = bool(getattr(vla, "use_rotation_6d", use_rotation_6d_cfg))
+    if use_relative or use_rotation_6d:
+        mode = "relative" if use_relative else "absolute"
+        log.info(
+            "Computing %s action stats from dataset (use_rotation_6d=%s)",
+            mode,
+            use_rotation_6d,
+        )
+        print(f"[bc_train] Computing {mode} action stats...", flush=True)
+        action_stats = _compute_action_normalization_stats(
             dataset,
+            use_relative_actions=use_relative,
+            use_rotation_6d=use_rotation_6d,
             action_chunk_size=int(cfg.dataset.get("action_chunk_size", 1)),
             batch_size=int(cfg.mode.batch_size) * 4,
             num_workers=int(cfg.mode.num_workers),
         )
         log.info(
-            "Relative action stats: mean=%s std=%s",
-            rel_stats["mean"].tolist(),
-            rel_stats["std"].tolist(),
+            "%s action stats: mean=%s std=%s",
+            mode.title(),
+            action_stats["mean"].tolist(),
+            action_stats["std"].tolist(),
         )
         vla.configure_processors(
             dataset.meta.stats,
-            action_stats=rel_stats,
-            action_stats_mode="relative",
+            action_stats=action_stats,
+            action_stats_mode=mode,
         )
-        print("[bc_train] LeRobot processors configured with relative action stats.", flush=True)
+        print(f"[bc_train] LeRobot processors configured with {mode} action stats.", flush=True)
     else:
         log.info("use_relative_actions=False; using LeRobot dataset.meta.stats for processors")
         vla.configure_processors(dataset.meta.stats, action_stats_mode="absolute")

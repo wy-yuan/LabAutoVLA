@@ -108,6 +108,14 @@ def _build_policy(cfg: DictConfig, obs: dict[str, Any], action_dim: int):
     image_keys = list(obs["images"].keys())
     model_kwargs = dict(OmegaConf.to_container(cfg.model.get("kwargs", {}), resolve=True))
     model_kwargs["device"] = cfg.device
+    raw_action_dim = action_dim
+    if cfg.model.name == "smolvla":
+        from vla.models.smolvla import learned_action_dim_from_raw
+
+        action_dim = learned_action_dim_from_raw(
+            raw_action_dim,
+            use_rotation_6d=bool(model_kwargs.get("use_rotation_6d", True)),
+        )
 
     log = logging.getLogger(__name__)
     if state_dim != 9:
@@ -117,9 +125,10 @@ def _build_policy(cfg: DictConfig, obs: dict[str, Any], action_dim: int):
             f"but adapter produced state_dim={state_dim}."
         )
     log.info(
-        "Building VLA model name=%s state_dim=%d action_dim=%d image_keys=%s",
+        "Building VLA model name=%s state_dim=%d raw_action_dim=%d model_action_dim=%d image_keys=%s",
         cfg.model.name,
         state_dim,
+        raw_action_dim,
         action_dim,
         image_keys,
     )
@@ -180,12 +189,14 @@ def _ensure_action_normalization(cfg: DictConfig, vla: Any) -> None:
     )
 
     use_relative = bool(getattr(vla, "use_relative_actions", False))
+    use_rotation_6d = bool(getattr(vla, "use_rotation_6d", False))
     mode = "relative" if use_relative else "absolute"
     action_stats = None
-    if use_relative:
+    if use_relative or use_rotation_6d:
         action_stats = _compute_action_normalization_stats(
             dataset,
-            use_relative_actions=True,
+            use_relative_actions=use_relative,
+            use_rotation_6d=use_rotation_6d,
             action_chunk_size=chunk_size,
             batch_size=int(dataset_cfg.get("stats_batch_size", 256)),
             num_workers=int(dataset_cfg.get("stats_num_workers", 0)),
