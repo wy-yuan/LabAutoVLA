@@ -310,8 +310,17 @@ try:
 
     @dataclass
     @ProcessorStepRegistry.register(name="labauto_quat_action_to_rotation_6d")
-    class QuaternionActionToRotation6DProcessorStep(ActionProcessorStep):
+    class QuaternionActionToRotation6DProcessorStep(ProcessorStep):
         """Convert action quaternions to Zhou 6D before LeRobot normalization."""
+
+        def __call__(self, transition):
+            self._current_transition = transition.copy()
+            new_transition = self._current_transition
+            action = new_transition.get(TransitionKey.ACTION)
+            if action is None:
+                return new_transition
+            new_transition[TransitionKey.ACTION] = self.action(action)
+            return new_transition
 
         def action(self, action):
             if not isinstance(action, torch.Tensor):
@@ -342,6 +351,8 @@ class SmolVLA(BaseVLA):
         # Optional overrides — left None to defer to the upstream defaults.
         chunk_size: int | None = None,
         n_action_steps: int | None = None,
+        num_steps: int | None = None,
+        use_cache: bool | None = None,
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = False,
         load_pretrained: bool = True,
@@ -386,6 +397,10 @@ class SmolVLA(BaseVLA):
             cfg_kwargs["chunk_size"] = chunk_size
         if n_action_steps is not None:
             cfg_kwargs["n_action_steps"] = n_action_steps
+        if num_steps is not None:
+            cfg_kwargs["num_steps"] = num_steps
+        if use_cache is not None:
+            cfg_kwargs["use_cache"] = use_cache
         cfg_kwargs["freeze_vision_encoder"] = freeze_vision_encoder
         cfg_kwargs["train_expert_only"] = train_expert_only
         cfg_kwargs["load_vlm_weights"] = load_vlm_weights

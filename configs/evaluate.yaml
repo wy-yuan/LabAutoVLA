@@ -16,8 +16,8 @@ defaults:
 device: "cuda:0"
 
 eval:
-  n_episodes: 3
-  max_steps: 400
+  n_episodes: 2
+  max_steps: 1000
 
 dataset:
   root: data/datasets/pipetting_v2_ep50

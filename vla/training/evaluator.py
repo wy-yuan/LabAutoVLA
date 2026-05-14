@@ -72,6 +72,8 @@ class RolloutEvaluator:
                     action = policy.predict_action(
                         images=obs["images"], state=obs["state"], task=obs["task"]
                     )
+                if not torch.isfinite(action).all():
+                    raise RuntimeError(f"Policy produced non-finite action at episode {ep}, step {t}")
                 # print(
                 #     f"[evaluator] action predicted  "
                 #     f"pos={action[..., :3].tolist()}  "
