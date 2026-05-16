@@ -37,7 +37,7 @@ generation:
     pipetting: "configs/task/pipetting.yaml"
 
   # Episode collection
-  num_episodes: 200                  # Total episodes to collect across all tasks
+  num_episodes: 4                  # Total episodes to collect across all tasks
   num_envs: 4                         # Number of parallel environments
 
   # Per-task episode counts (optional)
@@ -72,7 +72,7 @@ domain_randomization:
 # Output settings
 output:
   root: "data/datasets"               # Root output directory
-  dataset_name: pipetting_v3_ep200_envs4   # Optional explicit dataset name override
+  dataset_name: pipetting_v3_ep4_envs4   # Optional explicit dataset name override
   hdf5_subdir: "hdf5"                 # Subdirectory under root for collected HDF5 files
   overwrite_hdf5: false               # Replace existing HDF5 files if they already exist
   overwrite_lerobot: false            # Replace existing LeRobot dataset output if it already exists

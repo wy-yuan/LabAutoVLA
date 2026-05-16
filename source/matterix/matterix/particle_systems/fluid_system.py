@@ -214,6 +214,8 @@ class FluidSystem(ParticleSystem):
         # Refresh handle and solver iterations
         self.instancer = UsdGeom.PointInstancer.Get(self.stage, self.particle_point_instancer_path)
         particle_system.CreateSolverPositionIterationCountAttr().Set(SOLVER_POSITION_ITERATION_COUNT)
+        self._enable_particles_to_usd_on_prims(self.particle_system_path, self.particle_point_instancer_path)
+        # Keep the raw particle glyphs hidden; the smooth isosurface carries the liquid appearance.
         self.instancer.GetVisibilityAttr().Set("invisible")
 
         # Optional: pause/resume to ensure transparent material visibility

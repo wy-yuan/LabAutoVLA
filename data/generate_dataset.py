@@ -84,7 +84,7 @@ def ensure_sim_app():
     if simulation_app is None:
         from isaaclab.app import AppLauncher
 
-        _app_launcher = AppLauncher(headless=True, enable_cameras=True, livestream=2)
+        _app_launcher = AppLauncher(headless=True, enable_cameras=True, livestream=0)
         simulation_app = _app_launcher.app
     return simulation_app
 

@@ -450,7 +450,7 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
     observations = ObservationManagerCfg()
     events = EventCfg()
 
-    record_path = "datasets/pipetting_dataset.hdf5"
+    # record_path = "datasets/pipetting_dataset.hdf5"
 
     # ── Workflows ────────────────────────────────────────────────────────────
     workflows = {

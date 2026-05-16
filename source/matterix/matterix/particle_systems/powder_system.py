@@ -192,6 +192,7 @@ class PowderSystem(ParticleSystem):
         # Refresh handle and solver iterations
         self.instancer = UsdGeom.PointInstancer.Get(self.stage, self.particle_point_instancer_path)
         particle_system.CreateSolverPositionIterationCountAttr().Set(SOLVER_POSITION_ITERATIONS)
+        self._enable_particles_to_usd_on_prims(self.particle_system_path, self.particle_point_instancer_path)
 
         # Optional: pause/resume to ensure transparent material visibility
         if PAUSE_RESUME_WORKAROUND:

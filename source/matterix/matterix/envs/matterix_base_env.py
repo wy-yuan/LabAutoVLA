@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 from __future__ import annotations
 
+import carb
 import gymnasium as gym
 import math
 
@@ -127,6 +128,22 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
         self.metadata["render_fps"] = 1 / self.step_dt
 
         print("[INFO]: Completed setting up the environment...", flush=True)
+
+        # Keep PhysX particle state authored back to USD so headless RTX
+        # rendering/snapshots can see updated particles.
+        settings = carb.settings.get_settings()
+        settings.set_bool("/physics/updateToUsd", True)
+        settings.set_bool("/physics/updateParticlesToUsd", True)
+        settings.set_bool("/physics/updateVelocitiesToUsd", True)
+        settings.set_bool("/physics/suppressReadback", False)
+        print(
+            "[INFO] PhysX USD updates: "
+            f"updateToUsd={settings.get_as_bool('/physics/updateToUsd')}, "
+            f"updateParticlesToUsd={settings.get_as_bool('/physics/updateParticlesToUsd')}, "
+            f"updateVelocitiesToUsd={settings.get_as_bool('/physics/updateVelocitiesToUsd')}, "
+            f"suppressReadback={settings.get_as_bool('/physics/suppressReadback')}",
+            flush=True,
+        )
 
         self.particle_systems: dict[str, Particles] = {}
 

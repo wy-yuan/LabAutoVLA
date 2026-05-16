@@ -73,6 +73,19 @@ class ParticleSystem:
         self.velocities = None
         self.particleSpacing = None  # child sets this based on offsets
 
+    def _enable_particles_to_usd_on_prims(self, *prim_paths):
+        """Author the PhysX particle-to-USD update flag on particle prims."""
+        for prim_path in prim_paths:
+            if prim_path is None:
+                continue
+            prim = self.stage.GetPrimAtPath(prim_path)
+            if not prim or not prim.IsValid():
+                continue
+            attr = prim.GetAttribute("physics:updateParticlesToUsd")
+            if not attr:
+                attr = prim.CreateAttribute("physics:updateParticlesToUsd", Sdf.ValueTypeNames.Bool)
+            attr.Set(True)
+
     # -------------------------
     # Material look controls
     # -------------------------
