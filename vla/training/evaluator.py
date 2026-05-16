@@ -1,4 +1,4 @@
-"""Rollout + video-recording evaluator used after every BC epoch.
+"""Rollout + video-recording evaluator used during BC training.
 
 Works against any ``BaseVLA`` and any ``VLAEnvWrapper`` — keeps the
 training loop free of simulator-specific code.
@@ -7,7 +7,7 @@ Expected call pattern::
 
     evaluator = RolloutEvaluator(env=wrapped_env, n_episodes=3,
                                  video_dir="runs/eval_videos")
-    metrics = evaluator.run(vla, step=epoch)
+    metrics = evaluator.run(vla, step=global_step)
     # metrics = {"success_rate": 0.66, "episode_length": 412.0, ...}
 """
 

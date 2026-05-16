@@ -53,7 +53,7 @@ C:\isaacsim5.1\python -m data.generate_dataset stages.collect_hdf5=true stages.c
 
 #### Training on Generated Data
 ```bash
-C:\isaacsim5.1\python scripts/train.py mode=bc model=smolvla task=pipetting mode.sim_eval=false mode.epochs=50 mode.batch_size=4 mode.num_workers=4 mode.sim_eval=true
+C:\isaacsim5.1\python scripts/train.py mode=bc model=smolvla task=pipetting mode.steps=500000 mode.batch_size=4 mode.num_workers=4 mode.sim_eval=true
 ```
 
 #### Evaluation

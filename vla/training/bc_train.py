@@ -9,7 +9,7 @@ Pipeline
     2. Load a ``LeRobotDataset`` produced by
        :mod:`data.hdf5_to_lerobot`.
     3. Standard supervised loop: mini-batch -> ``vla.compute_loss`` ->
-       Adam/AdamW step -> log -> eval every ``cfg.mode.eval_every`` epochs.
+       Adam/AdamW step -> log -> eval every ``cfg.mode.eval_every`` steps.
     4. On evaluation we boot the Matterix env (only if requested — it's
        expensive) and roll out a few episodes; videos + success rate go
        to the logger.
@@ -422,6 +422,30 @@ def _build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _resolve_total_train_steps(cfg: DictConfig, train_loader_len: int) -> int:
+    """Return the optimizer-step training horizon.
+
+    ``mode.steps`` is the BC convention. ``mode.epochs`` is accepted only as
+    a legacy fallback so older command lines fail gently.
+    """
+    steps = cfg.mode.get("steps", None)
+    if steps is not None:
+        total_steps = int(steps)
+    else:
+        epochs = cfg.mode.get("epochs", None)
+        if epochs is None:
+            raise ValueError("BC training requires mode.steps")
+        total_steps = int(epochs) * int(train_loader_len)
+        log.warning(
+            "mode.epochs is deprecated for BC; use mode.steps=%d instead",
+            total_steps,
+        )
+
+    if total_steps <= 0:
+        raise ValueError(f"mode.steps must be positive, got {total_steps}")
+    return total_steps
+
+
 def _episode_indices_from_lerobot_dataset(dataset) -> dict[int, list[int]]:
     """Return dataset sample indices grouped by episode index."""
     root = getattr(dataset, "root", None)
@@ -780,6 +804,10 @@ def run_bc(cfg: DictConfig) -> None:
         pin_memory=True,
         drop_last=False,
     )
+    if len(train_loader) == 0:
+        raise ValueError(
+            "Training loader produced no batches; reduce mode.batch_size or add more data"
+        )
 
     # -- Model ---------------------------------------------------------
     # Infer proprio state dim from a sample batch so we don't hardcode it.
@@ -880,7 +908,7 @@ def run_bc(cfg: DictConfig) -> None:
 
     # -- Optim + Logger ------------------------------------------------
     optim = _build_optimizer(vla, cfg)
-    total_train_steps = len(train_loader) * int(cfg.mode.epochs)
+    total_train_steps = _resolve_total_train_steps(cfg, len(train_loader))
     scheduler = _build_scheduler(optim, cfg, total_train_steps)
     if scheduler is not None:
         log.info(
@@ -908,11 +936,61 @@ def run_bc(cfg: DictConfig) -> None:
 
     # -- Loop ----------------------------------------------------------
     try:
+        ckpt_every = int(cfg.mode.get("ckpt_every", 0) or 0)
+        val_every = int(cfg.mode.get("val_every", 0) or 0)
+        eval_every = int(cfg.mode.get("eval_every", 0) or 0)
         global_step = 0
-        for epoch in range(cfg.mode.epochs):
+        data_epoch = 0
+        last_loss = float("nan")
+        last_val_step = 0
+        last_ckpt_step = 0
+
+        def _save_checkpoint(step: int) -> None:
+            nonlocal last_ckpt_step
+            ckpt_dir = Path(cfg.output_dir) / f"ckpt_step{step:06d}"
+            vla.save_pretrained(ckpt_dir)
+            last_ckpt_step = step
+            log.info("Saved checkpoint to %s", ckpt_dir)
+            print(f"[bc_train] Saved checkpoint at step {step} !!!", flush=True)
+
+        def _run_validation(step: int, *, final: bool = False) -> float:
+            nonlocal last_val_step
+            val_loss = _validate(vla, val_loader)
+            logger.scalar("val/loss", val_loss, step)
+            last_val_step = step
             vla.train()
-            log.info("Starting training epoch %d !!!", epoch + 1)
+            if final:
+                log.info("final val@step%d: %.4f", step, val_loss)
+            else:
+                log.info("val@step%d: %.4f", step, val_loss)
+            return val_loss
+
+        def _run_eval(step: int) -> None:
+            if eval_runner is None:
+                return
+            print(f"[bc_train] Running evaluation at step {step} !!!", flush=True)
+            try:
+                metrics = eval_runner.run(vla, step=step)
+            finally:
+                vla.train()
+            print("[bc_train] Evaluation complete !!!", flush=True)
+            for k, v in metrics.items():
+                logger.scalar(f"eval/{k}", v, step)
+            log.info("eval@step%d: %s", step, metrics)
+            print("[bc_train] eval@step%d: %s" % (step, metrics), flush=True)
+
+        while global_step < total_train_steps:
+            data_epoch += 1
+            vla.train()
+            log.info(
+                "Starting training data pass %d at step %d/%d",
+                data_epoch,
+                global_step,
+                total_train_steps,
+            )
             for batch in train_loader:
+                if global_step >= total_train_steps:
+                    break
                 batch = vla.preprocess_batch(batch)
                 out = vla.compute_loss(batch)
                 loss = out.loss
@@ -926,7 +1004,9 @@ def run_bc(cfg: DictConfig) -> None:
                 if scheduler is not None:
                     scheduler.step()
 
-                logger.scalar("train/loss", float(loss.detach()), global_step)
+                last_loss = float(loss.detach())
+                global_step += 1
+                logger.scalar("train/loss", last_loss, global_step)
                 logger.scalar("train/lr", float(optim.param_groups[0]["lr"]), global_step)
                 if out.aux:
                     for key, value in out.aux.items():
@@ -934,35 +1014,29 @@ def run_bc(cfg: DictConfig) -> None:
                             logger.scalar(f"train/aux/{key}", float(value.detach()), global_step)
                         elif isinstance(value, (int, float)):
                             logger.scalar(f"train/aux/{key}", float(value), global_step)
-                global_step += 1
 
-            val_loss = _validate(vla, val_loader)
-            logger.scalar("val/loss", val_loss, global_step)
-            vla.train()
+                if ckpt_every > 0 and global_step % ckpt_every == 0:
+                    _save_checkpoint(global_step)
+
+                if val_every > 0 and global_step % val_every == 0:
+                    _run_validation(global_step)
+
+                if eval_every > 0 and global_step % eval_every == 0:
+                    _run_eval(global_step)
 
             log.info(
-                "epoch %d done (step=%d, train_loss=%.4f, val_loss=%.4f)",
-                epoch,
+                "data pass %d done (step=%d/%d, train_loss=%.4f)",
+                data_epoch,
                 global_step,
-                float(loss.detach()),
-                val_loss,
+                total_train_steps,
+                last_loss,
             )
 
-            # -- Periodic checkpoint + eval ---------------------------
-            if (epoch + 1) % cfg.mode.ckpt_every == 0 or epoch + 1 == cfg.mode.epochs:
-                ckpt_dir = Path(cfg.output_dir) / f"ckpt_epoch{epoch + 1:04d}"
-                vla.save_pretrained(ckpt_dir)
-                log.info("Saved checkpoint to %s", ckpt_dir)
-                print("[bc_train] Saved checkpoint !!!", flush=True)
+        if last_val_step != global_step:
+            _run_validation(global_step, final=True)
 
-            if eval_runner is not None and (epoch + 1) % cfg.mode.eval_every == 0:
-                print("[bc_train] Running evaluation !!!", flush=True)
-                metrics = eval_runner.run(vla, step=epoch + 1)
-                print("[bc_train] Evaluation complete !!!", flush=True)
-                for k, v in metrics.items():
-                    logger.scalar(f"eval/{k}", v, global_step)
-                log.info("eval@epoch%d: %s", epoch + 1, metrics)
-                print("[bc_train] eval@epoch%d: %s" % (epoch + 1, metrics), flush=True)
+        if last_ckpt_step != global_step:
+            _save_checkpoint(global_step)
     finally:
         if eval_runner is not None:
             eval_runner.close()

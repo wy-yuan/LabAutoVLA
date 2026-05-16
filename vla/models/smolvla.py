@@ -360,13 +360,19 @@ class SmolVLA(BaseVLA):
         use_relative_actions: bool = False,
         use_rotation_6d: bool = True,
         step0_loss_weight: float = 1.0,
+        gripper_loss_weight: float = 1.0,
         device: str | torch.device = "cuda",
     ):
         super().__init__(action_dim=action_dim, state_dim=state_dim, image_keys=image_keys)
         self._device = torch.device(device)
         self.use_relative_actions = use_relative_actions
         self.use_rotation_6d = use_rotation_6d
-        self.step0_loss_weight = step0_loss_weight
+        self.step0_loss_weight = float(step0_loss_weight)
+        self.gripper_loss_weight = float(gripper_loss_weight)
+        if self.step0_loss_weight <= 0.0:
+            raise ValueError(f"step0_loss_weight must be positive, got {self.step0_loss_weight}")
+        if self.gripper_loss_weight <= 0.0:
+            raise ValueError(f"gripper_loss_weight must be positive, got {self.gripper_loss_weight}")
         self._action_norm_mode = "relative" if self.use_relative_actions else "absolute"
         self._processor_stats: dict[str, dict[str, Any]] = {}
         self.preprocessor: Any | None = None
@@ -440,29 +446,14 @@ class SmolVLA(BaseVLA):
     def compute_loss(self, batch: Mapping[str, Any]) -> VLAOutput:
         """Delegate to the underlying policy's forward-with-loss path."""
         batch = self._move_to_device(batch)
-        # LeRobot policies return either a dict (preferred) or a tuple
-        # (loss, info). We normalise.
-        result = self.policy.forward(batch)
-        if isinstance(result, tuple):
-            loss, info = result[0], result[1] if len(result) > 1 else {}
-        elif isinstance(result, dict):
-            loss = result.get("loss")
-            info = {k: v for k, v in result.items() if k != "loss"}
-        else:
-            loss, info = result, {}
+        loss, info = self._compute_policy_loss(batch)
 
         # Extra weight on step-0: second forward pass with only step-0 unmasked.
         # Adds (step0_loss_weight - 1) * L_step0 so the gradient from step-0
         # is amplified relative to later chunk steps.
         if self.step0_loss_weight != 1.0 and loss is not None:
             step0_batch = self._make_step0_only_batch(batch)
-            r0 = self.policy.forward(step0_batch)
-            if isinstance(r0, tuple):
-                loss0 = r0[0]
-            elif isinstance(r0, dict):
-                loss0 = r0.get("loss")
-            else:
-                loss0 = r0
+            loss0, _ = self._compute_policy_loss(step0_batch)
             if loss0 is not None:
                 loss = loss + (self.step0_loss_weight - 1.0) * loss0
 
@@ -538,6 +529,78 @@ class SmolVLA(BaseVLA):
         if "action_is_pad" in step0:
             step0["action_is_pad"] = pad
         return step0
+
+    def _compute_policy_loss(self, batch: dict) -> tuple[torch.Tensor | None, dict[str, Any]]:
+        if self.gripper_loss_weight == 1.0:
+            return self._call_policy_forward(batch)
+        return self._weighted_policy_forward(batch)
+
+    def _call_policy_forward(self, batch: dict) -> tuple[torch.Tensor | None, dict[str, Any]]:
+        # LeRobot policies return either a dict (preferred), a tuple (loss, info),
+        # or a bare scalar loss. Normalize that surface for the trainer.
+        result = self.policy.forward(batch)
+        if isinstance(result, tuple):
+            return result[0], result[1] if len(result) > 1 else {}
+        if isinstance(result, dict):
+            return result.get("loss"), {k: v for k, v in result.items() if k != "loss"}
+        return result, {}
+
+    def _weighted_policy_forward(self, batch: dict) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Run SmolVLA's loss path with extra weight on gripper dimensions."""
+        try:
+            from lerobot.utils.constants import (
+                ACTION,
+                OBS_LANGUAGE_ATTENTION_MASK,
+                OBS_LANGUAGE_TOKENS,
+                OBS_STATE,
+            )
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("SmolVLA gripper loss weighting requires the `lerobot` package.") from exc
+
+        policy = self.policy
+        batch_for_policy = dict(batch)
+        if getattr(policy.config, "adapt_to_pi_aloha", False):
+            batch_for_policy[OBS_STATE] = policy._pi_aloha_decode_state(
+                batch_for_policy[OBS_STATE]
+            )
+            batch_for_policy[ACTION] = policy._pi_aloha_encode_actions_inv(batch_for_policy[ACTION])
+
+        images, img_masks = policy.prepare_images(batch_for_policy)
+        state = policy.prepare_state(batch_for_policy)
+        lang_tokens = batch_for_policy[OBS_LANGUAGE_TOKENS]
+        lang_masks = batch_for_policy[OBS_LANGUAGE_ATTENTION_MASK]
+        actions = policy.prepare_action(batch_for_policy)
+        losses = policy.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
+
+        original_action_dim = int(policy.config.action_feature.shape[0])
+        losses = losses[:, :, :original_action_dim]
+        info: dict[str, Any] = {
+            "losses_after_forward": float(losses.detach().mean()),
+            "gripper_loss_weight": self.gripper_loss_weight,
+        }
+
+        gripper_start = 9 if self.use_rotation_6d else 7
+        if gripper_start < losses.shape[-1]:
+            weights = torch.ones(losses.shape[-1], dtype=losses.dtype, device=losses.device)
+            weights[gripper_start:] = self.gripper_loss_weight
+            losses = losses * weights.view(1, 1, -1)
+            info["losses_after_gripper_weight"] = float(losses.detach().mean())
+
+        actions_is_pad = batch_for_policy.get("action_is_pad", batch_for_policy.get("actions_id_pad"))
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad.to(torch.bool)
+            losses = losses * in_episode_bound.unsqueeze(-1)
+            info["losses_after_in_ep_bound"] = float(losses.detach().mean())
+
+        losses = losses[:, :, : int(policy.config.max_action_dim)]
+        info["losses_after_rm_padding"] = float(losses.detach().mean())
+        if actions_is_pad is None:
+            loss = losses.mean()
+        else:
+            num_valid = ((~actions_is_pad.to(torch.bool)).sum() * losses.shape[-1]).clamp_min(1)
+            loss = losses.sum() / num_valid
+        info["loss"] = float(loss.detach())
+        return loss, info
 
     @staticmethod
     def _copy_stats(stats: Mapping[str, Mapping[str, Any]] | None) -> dict[str, dict[str, Any]]:
