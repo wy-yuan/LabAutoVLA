@@ -74,6 +74,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
         dispense_duration: Time (s) to hold at the target dip position. Default: 1.5.
         lift_height: Upward clearance (m) after each dip. Default: 0.08.
         interpolation_duration: Time (s) to ramp each move primitive from current pose to target.
+        gripper_interpolation_duration: Time (s) to ramp open/close gripper commands.
         action_space_info: Action space metadata for the robot. REQUIRED.
     """
 
@@ -92,6 +93,7 @@ class PipetteLiquidCfg(CompositionalActionCfg):
     lift_height: float = 0.15         # m — clearance height after each dip
 
     interpolation_duration: float = 0.8  # s — time to ramp each move from current to target pose
+    gripper_interpolation_duration: float = 1.2  # s — time to ramp gripper commands
 
     pre_grasp_position_noise_range: dict[str, tuple[float, float]] | None = {
         "x": (-0.01, 0.01),
@@ -129,7 +131,8 @@ class PipetteLiquidCfg(CompositionalActionCfg):
             OpenGripperCfg(
                 # target_value=0.1, # open gripper to 20% for pick-up
                 agent_assets=self.agent_assets,
-                duration=0.2,
+                duration=0.5,
+                interpolation_duration=self.gripper_interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
 
@@ -142,7 +145,8 @@ class PipetteLiquidCfg(CompositionalActionCfg):
             ),
             CloseGripperCfg(
                 agent_assets=self.agent_assets,
-                duration=0.2,
+                duration=0.5,
+                interpolation_duration=self.gripper_interpolation_duration,
                 action_space_info=self.action_space_info,
             ),
             _relaxed_move_to_frame(

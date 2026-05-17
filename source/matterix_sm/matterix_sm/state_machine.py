@@ -205,11 +205,18 @@ class StateMachine:
 
             # Gripper is common to both joint and task space
             if robot_data.gripper_pos is not None and action_space_info.gripper_indices is not None:
-                # Gripper pos is typically (num_envs, 2) for two fingers
-                # Average to get single value per environment
-                gripper_avg = robot_data.gripper_pos.mean(dim=-1)
+                # Panda gripper observations store opposing finger signs, e.g. [0.04, -0.04].
+                gripper_opening = robot_data.gripper_pos.abs().mean(dim=-1)
+                command_mode = getattr(action_space_info, "gripper_command_mode", "binary")
+                if command_mode == "position":
+                    gripper_command = gripper_opening
+                else:
+                    closed = getattr(action_space_info, "gripper_closed_position", 0.0)
+                    open_ = getattr(action_space_info, "gripper_open_position", 0.04)
+                    denom = max(abs(open_ - closed), 1e-6)
+                    gripper_command = (2.0 * ((gripper_opening - closed) / denom) - 1.0).clamp(-1.0, 1.0)
                 for idx in action_space_info.gripper_indices:
-                    init_tensor[:, idx] = gripper_avg
+                    init_tensor[:, idx] = gripper_command
 
         return init_tensor
 

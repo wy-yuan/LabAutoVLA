@@ -31,6 +31,7 @@ from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
 from isaaclab_tasks.manager_based.manipulation.stack.mdp import franka_stack_events
 
 from ..matterix_articulation import MatterixArticulationCfg
+from .gripper_actions import MirroredJointPositionActionCfg
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 
@@ -231,8 +232,8 @@ class FRANKA_PANDA_CFG(MatterixArticulationCfg):
                     0.0044,
                     2.3775,
                     0.6952,
-                    0.0400,
-                    0.0400,
+                    0.0000,
+                    0.0000,
                 ],
             },
         ),
@@ -333,10 +334,9 @@ class FRANKA_PANDA_HIGH_PD_IK_CFG(FRANKA_PANDA_CFG):
             controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
             body_offset=DifferentialInverseKinematicsActionCfg.OffsetCfg(pos=(0.0, 0.0, 0.107)),
         ),
-        "gripper_action": mdp.BinaryJointPositionActionCfg(
+        "gripper_action": MirroredJointPositionActionCfg(
             joint_names=["panda_finger.*"],
-            open_command_expr={"panda_finger_.*": 0.04},
-            close_command_expr={"panda_finger_.*": 0.0},
+            command_clip=(0.0, 0.04),
         ),
     }
 

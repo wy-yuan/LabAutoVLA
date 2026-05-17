@@ -30,6 +30,10 @@ class ActionSpaceInfo:
         position_indices: Indices for EE position control (e.g., (0,1,2))
         orientation_indices: Indices for EE orientation control (e.g., (3,4,5,6))
         gripper_indices: Indices for gripper control (e.g., (7,))
+        gripper_command_mode: How gripper values are interpreted by the environment action term.
+            "binary" uses negative/positive open-close commands; "position" uses joint-position targets.
+        gripper_closed_position: Joint-position target for fully closed gripper control.
+        gripper_open_position: Joint-position target for fully open gripper control.
         joint_indices: Indices for direct joint control (optional, for joint-level control)
         grasp_to_ee_offset: Transform from grasp frame to EE frame (pos, quat).
                            This is the robot-specific offset that accounts for gripper geometry.
@@ -52,6 +56,9 @@ class ActionSpaceInfo:
     position_indices: tuple[int, ...] | None = None
     orientation_indices: tuple[int, ...] | None = None
     gripper_indices: tuple[int, ...] | None = None
+    gripper_command_mode: str = "binary"
+    gripper_closed_position: float = 0.0
+    gripper_open_position: float = 0.04
     joint_indices: tuple[int, ...] | None = None
     grasp_to_ee_offset: tuple[tuple[float, float, float], tuple[float, float, float, float]] | None = None
 
@@ -65,6 +72,9 @@ FRANKA_IK_ACTION_SPACE = ActionSpaceInfo(
     position_indices=(0, 1, 2),
     orientation_indices=(3, 4, 5, 6),
     gripper_indices=(7,),
+    gripper_command_mode="position",
+    gripper_closed_position=0.0,
+    gripper_open_position=0.04,
     grasp_to_ee_offset=(
         (0.0, 0.0, 0.0),  # 10.34cm offset along z-axis (typical for Franka gripper)
         (0.0, -1.0, 0.0, 0.0),  # Identity rotation (no rotation offset)
