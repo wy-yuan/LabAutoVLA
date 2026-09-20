@@ -34,6 +34,7 @@ generation:
   # Tasks to generate data for
   tasks: ["pipetting"]                 # List of task aliases (e.g., ["pipetting"] or ["pipetting", "beaker_pick"])
   task_cfg_paths:
+    picking: "configs/task/picking.yaml"
     pipetting: "configs/task/pipetting.yaml"
 
   # Episode collection
@@ -46,7 +47,7 @@ generation:
                                       # Must sum to num_episodes
 
   # Episode length
-  max_steps: 800                      # Max timesteps per episode (truncate/pad to this)
+  max_steps: 1500                      # Max timesteps per episode (truncate/pad to this)
 
   # Reproducibility
   seed: 42                            # Random seed for reproducibility
@@ -78,7 +79,7 @@ output:
   overwrite_lerobot: false            # Replace existing LeRobot dataset output if it already exists
   repo_id: null                       # Optional LeRobot repo_id override (defaults to local/<dataset_name>)
   format: "lerobot"                   # Output format (only "lerobot" supported)
-  fps: 30                             # Frames per second (metadata)
+  fps: 60                             # Frames per second (metadata)
   video_codec: "libx264"              # Video codec (H.264, more compatible and easy to compare with run_workflow)
   video_crf: 20                       # Lower CRF = higher quality / higher bitrate (18-20 is visually strong)
   use_videos: true                    # Save images as MP4 videos (vs raw frames)

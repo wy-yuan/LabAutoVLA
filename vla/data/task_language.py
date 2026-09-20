@@ -147,8 +147,8 @@ class TaskLanguageTemplate:
         else:
             params = kwargs
 
-        # Choose random template
-        template = self.rng.choice(self.templates)
+        # NumPy returns np.str_ for string choices; normalize it before formatting.
+        template = str(self.rng.choice(self.templates))
 
         # Format template with parameters
         try:
@@ -159,5 +159,5 @@ class TaskLanguageTemplate:
                 f"but available parameters are: {list(params.keys())}"
             )
 
-        return instruction
+        return str(instruction)
 

@@ -260,11 +260,7 @@ def action_to_env_action(action: torch.Tensor) -> torch.Tensor:
     processed = action.clone()
     processed[..., 3:7] = _quat_normalize(processed[..., 3:7])
     gripper_open = processed[..., 7:8].clamp(0.0, 1.0)
-    processed[..., 7:8] = torch.where(
-        gripper_open >= 0.5,
-        torch.ones_like(gripper_open),
-        -torch.ones_like(gripper_open),
-    )
+    processed[..., 7:8] = gripper_open * 0.04
     return processed
 
 

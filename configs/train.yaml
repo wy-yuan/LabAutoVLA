@@ -15,14 +15,14 @@ defaults:
 
 # Default dataset location for pipetting training.
 dataset:
-  src_hdf5: data/datasets/hdf5/pipetting_v3_ep200_envs4/pipetting.hdf5
-  root: data/datasets/pipetting_v3_ep200_envs4
-  repo_id: local/pipetting_v3_ep200_envs4
-  fps: 30
-  action_chunk_size: 50
+  src_hdf5: data/datasets/hdf5/pipetting_v6_action_hold05_ep200/pipetting.hdf5
+  root: data/datasets/pipetting_v6_action_hold05_ep200
+  repo_id: local/pipetting_v6_action_hold05_ep200
+  fps: 60
+  action_chunk_size: 100
 
 # Where every output (ckpts, videos, TB logs) lands for this run.
-output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_${mode.name}
+output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_${mode.name}_${task.workflow.name}
 
 hydra:
   run:

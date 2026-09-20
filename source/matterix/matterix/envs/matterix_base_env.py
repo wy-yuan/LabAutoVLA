@@ -289,9 +289,7 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
             self.scene.write_data_to_sim()
             self.sim.forward()
 
-            # if sensors are added to the scene, make sure we render to reflect changes in reset
-            if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
-                self.sim.render()
+            self._refresh_rtx_sensors_after_reset()
 
             # trigger recorder terms for post-reset calls
             self.recorder_manager.record_post_reset(reset_env_ids)
@@ -476,6 +474,19 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
         # reset the episode length buffer
         self.episode_length_buf[env_ids] = 0
 
+    def _refresh_rtx_sensors_after_reset(self) -> None:
+        """Advance reset state into RTX sensor buffers before observations are read."""
+        if not self.sim.has_rtx_sensors():
+            return
+
+        for _ in range(self.cfg.num_rerenders_on_reset):
+            # A render-only update leaves TiledCamera on the previous frame after
+            # articulation joints are teleported during reset. One simulation tick
+            # propagates the new link transforms through PhysX/Fabric into RTX.
+            self.sim.step(render=True)
+            self._sim_step_counter += 1
+            self.scene.update(dt=self.physics_dt)
+
     def reset(
         self,
         seed: int | None = None,
@@ -516,9 +527,7 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
         # update articulation kinematics
         self.scene.write_data_to_sim()
         self.sim.forward()
-        # if sensors are added to the scene, make sure we render to reflect changes in reset
-        if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
-            self.sim.render()
+        self._refresh_rtx_sensors_after_reset()
 
         # trigger recorder terms for post-reset calls
         self.recorder_manager.record_post_reset(env_ids)

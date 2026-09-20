@@ -20,7 +20,7 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.sensors import FrameTransformer, TiledCamera
-from isaaclab.utils.math import euler_xyz_from_quat
+from isaaclab.utils.math import euler_xyz_from_quat, subtract_frame_transforms
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
@@ -42,6 +42,28 @@ def ee_env_pos(env: ManagerBasedEnv, asset_name: str) -> torch.Tensor:
     ee_frame: FrameTransformer = env.scene[ee_frame_name]
     ee_frame_pos = ee_frame.data.target_pos_w[:, 0, :] - env.scene.env_origins[:, 0:3]
     return ee_frame_pos
+
+
+def _ee_base_pose(env: ManagerBasedEnv, asset_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the end-effector pose expressed in the robot root frame."""
+    robot = env.scene[asset_name]
+    ee_frame: FrameTransformer = env.scene[f"ee_frame_{asset_name}"]
+    return subtract_frame_transforms(
+        robot.data.root_pos_w,
+        robot.data.root_quat_w,
+        ee_frame.data.target_pos_w[..., 0, :],
+        ee_frame.data.target_quat_w[..., 0, :],
+    )
+
+
+def ee_base_pos(env: ManagerBasedEnv, asset_name: str) -> torch.Tensor:
+    """End-effector position expressed in the robot root frame."""
+    return _ee_base_pose(env, asset_name)[0]
+
+
+def ee_base_quat(env: ManagerBasedEnv, asset_name: str) -> torch.Tensor:
+    """End-effector orientation expressed in the robot root frame."""
+    return _ee_base_pose(env, asset_name)[1]
 
 
 def ee_euler_xyz(env: ManagerBasedEnv, asset_name: str) -> torch.Tensor:

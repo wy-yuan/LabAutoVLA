@@ -1,0 +1,24 @@
+# Pipette picking task (LabAuto-Test-Pipetting-Franka-v1).
+id: LabAuto-Test-Pipetting-Franka-v1
+prompt: "Pick up the pipette from the rack."
+
+adapter:
+  image_keys:
+    overhead: camera/overhead_rgb
+    wrist: camera/wrist_rgb
+  state_keys:
+    - articulations/robot__ee_base_pos      # (3,)
+    - articulations/robot__ee_base_quat     # (4,)
+    - articulations/robot__gripper_pos      # (2,)
+  image_size: [224, 224]
+
+language_generation:
+  templates:
+    - "Pick up the pipette from the rack."
+    - "Grasp the pipette and lift it out of the rack."
+    - "Lift the pipette from its holder."
+    - "Take the pipette out of the rack."
+  parameters: {}
+
+workflow:
+  name: "picking_pipette"

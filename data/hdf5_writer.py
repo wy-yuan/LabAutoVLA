@@ -74,14 +74,19 @@ class HDF5DatasetWriter:
 
         demo_name = f"demo_{self.episode_count}"
         episode_group = self._data_group.create_group(demo_name)
-        episode_group.attrs["num_samples"] = int(actions_np.shape[0])
-        episode_group.attrs["task"] = task
-        episode_group.attrs["task_id"] = task_id
-        if success is not None:
-            episode_group.attrs["success"] = bool(success)
+        try:
+            episode_group.attrs["num_samples"] = int(actions_np.shape[0])
+            episode_group.attrs["task"] = str(task)
+            episode_group.attrs["task_id"] = str(task_id)
+            if success is not None:
+                episode_group.attrs["success"] = bool(success)
 
-        _write_nested(episode_group, "obs", observations)
-        episode_group.create_dataset("actions", data=actions_np, compression="gzip")
+            _write_nested(episode_group, "obs", observations)
+            episode_group.create_dataset("actions", data=actions_np, compression="gzip")
+        except Exception:
+            del self._data_group[demo_name]
+            self.flush()
+            raise
 
         num_samples = int(actions_np.shape[0])
         self.total_samples += num_samples

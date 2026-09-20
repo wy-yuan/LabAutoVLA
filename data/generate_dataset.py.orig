@@ -472,11 +472,13 @@ def execute_episode(
             )
 
         action_tensor = workflow_executor.step(obs)
-        dataset_actions = _action_tensor_to_dataset_action(action_tensor)
         obs, _, terminated, truncated, _ = env.step(action_tensor)
+        next_actions = _extract_next_ee_actions_base(obs)
 
         for env_idx in active_envs:
-            raw_action_steps[env_idx].append(dataset_actions[env_idx])
+            # Record where the robot actually ended up after this step. Using the
+            # state machine's goal directly produces constant actions per primitive.
+            raw_action_steps[env_idx].append(next_actions[env_idx])
 
             workflow_done = workflow_executor.is_done(env_index=env_idx)
             env_done = _env_done(terminated, env_idx) or _env_done(truncated, env_idx)

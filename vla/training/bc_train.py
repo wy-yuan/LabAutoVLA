@@ -31,6 +31,7 @@ import faulthandler
 import json
 import logging
 import math
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -82,11 +83,139 @@ def _video_feature_keys(root: Path) -> list[str]:
     ]
 
 
+
+def _chunk_file_indices(path: Path) -> tuple[int, int]:
+    """Parse LeRobot chunk-000/file-000 indices from a dataset path."""
+    return int(path.parent.name.split("-")[-1]), int(path.stem.split("-")[-1])
+
+
+def _video_file_segments(root: Path, video_key: str, fps: int) -> list[dict[str, Any]]:
+    """Return cumulative frame ranges for a video key's split MP4 files."""
+    from lerobot.datasets.video_utils import get_video_duration_in_s
+
+    video_files = sorted((root / "videos" / video_key).glob("chunk-*/*.mp4"), key=_chunk_file_indices)
+    if not video_files:
+        raise FileNotFoundError(f"No video files found for LeRobot video key '{video_key}'")
+
+    segments: list[dict[str, Any]] = []
+    start_frame = 0
+    for video_file in video_files:
+        chunk_index, file_index = _chunk_file_indices(video_file)
+        duration_s = float(get_video_duration_in_s(video_file))
+        frame_count = int(round(duration_s * fps))
+        if frame_count <= 0:
+            raise ValueError(f"Video file has no frames: {video_file}")
+
+        end_frame = start_frame + frame_count
+        segments.append(
+            {
+                "chunk_index": chunk_index,
+                "file_index": file_index,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "duration_s": duration_s,
+            }
+        )
+        start_frame = end_frame
+
+    return segments
+
+
+def _find_video_segment(
+    segments: list[dict[str, Any]],
+    *,
+    episode_index: int,
+    video_key: str,
+    start_frame: int,
+    end_frame: int,
+) -> dict[str, Any]:
+    for segment in segments:
+        if start_frame >= segment["start_frame"] and end_frame <= segment["end_frame"]:
+            return segment
+
+    raise ValueError(
+        f"Episode {episode_index} frames [{start_frame}, {end_frame}) do not fit in a single "
+        f"MP4 segment for video key '{video_key}'."
+    )
+
+
+def _episode_metadata_is_readable(root: Path, episode_files: list[Path], fps: int) -> tuple[bool, str | None]:
+    """Return whether all local episode metadata parquet files are readable and usable."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tables = []
+    for path in episode_files:
+        try:
+            if path.stat().st_size < 8:
+                return False, f"{path} is too small to be a parquet file"
+            with path.open("rb") as f:
+                f.seek(-4, 2)
+                if f.read() != b"PAR1":
+                    return False, f"{path} is missing the parquet footer magic bytes"
+            pq.read_schema(path)
+            tables.append(pq.read_table(path))
+        except Exception as exc:
+            return False, f"{path}: {exc}"
+
+    if not tables:
+        return True, None
+
+    table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    columns = table.to_pydict()
+    video_keys = _video_feature_keys(root)
+    for video_key in video_keys:
+        required_columns = [
+            f"videos/{video_key}/chunk_index",
+            f"videos/{video_key}/file_index",
+            f"videos/{video_key}/from_timestamp",
+            f"videos/{video_key}/to_timestamp",
+        ]
+        missing_columns = [col for col in required_columns if col not in columns]
+        if missing_columns:
+            return False, f"episode metadata is missing video columns: {missing_columns}"
+
+        segments = {
+            (segment["chunk_index"], segment["file_index"]): segment
+            for segment in _video_file_segments(root, video_key, fps)
+        }
+        tolerance_s = max(1.0 / fps, 1e-3)
+        for episode_index, chunk_index, file_index, from_timestamp, to_timestamp in zip(
+            columns.get("episode_index", []),
+            columns[f"videos/{video_key}/chunk_index"],
+            columns[f"videos/{video_key}/file_index"],
+            columns[f"videos/{video_key}/from_timestamp"],
+            columns[f"videos/{video_key}/to_timestamp"],
+            strict=True,
+        ):
+            segment = segments.get((int(chunk_index), int(file_index)))
+            if segment is None:
+                return (
+                    False,
+                    f"episode {episode_index} references missing {video_key} video file "
+                    f"chunk={chunk_index} file={file_index}",
+                )
+            if float(from_timestamp) < -tolerance_s:
+                return False, f"episode {episode_index} has negative {video_key} from_timestamp"
+            if float(to_timestamp) > segment["duration_s"] + tolerance_s:
+                return (
+                    False,
+                    f"episode {episode_index} {video_key} timestamps exceed referenced video duration",
+                )
+
+    return True, None
+
+
 def _ensure_local_episode_metadata(root: Path, fps: int) -> None:
-    """Create missing ``meta/episodes`` metadata for a local LeRobot dataset."""
+    """Create or repair ``meta/episodes`` metadata for a local LeRobot dataset."""
     episodes_dir = root / "meta" / "episodes"
-    if any(episodes_dir.glob("*/*.parquet")):
-        return
+    episode_files = sorted(episodes_dir.glob("*/*.parquet"))
+    if episode_files:
+        is_readable, reason = _episode_metadata_is_readable(root, episode_files, fps)
+        if is_readable:
+            return
+        log.warning("Rebuilding unreadable LeRobot episode metadata: %s", reason)
+        shutil.rmtree(episodes_dir)
 
     data_files = sorted((root / "data").glob("*/*.parquet"))
     if not data_files:
@@ -101,6 +230,7 @@ def _ensure_local_episode_metadata(root: Path, fps: int) -> None:
 
     task_index_to_name = _load_task_index_mapping(tasks_path)
     video_keys = _video_feature_keys(root)
+    video_segments = {video_key: _video_file_segments(root, video_key, fps) for video_key in video_keys}
     episode_records: dict[int, dict[str, Any]] = {}
 
     for data_file in data_files:
@@ -139,7 +269,7 @@ def _ensure_local_episode_metadata(root: Path, fps: int) -> None:
         raise ValueError(f"No episode rows found in local dataset under {root}")
 
     rows: list[dict[str, Any]] = []
-    for metadata_file_index, ep_idx in enumerate(sorted(episode_records)):
+    for ep_idx in sorted(episode_records):
         record = episode_records[ep_idx]
         row = {
             "episode_index": int(record["episode_index"]),
@@ -150,24 +280,29 @@ def _ensure_local_episode_metadata(root: Path, fps: int) -> None:
             "data/chunk_index": int(record["data/chunk_index"]),
             "data/file_index": int(record["data/file_index"]),
             "meta/episodes/chunk_index": 0,
-            "meta/episodes/file_index": metadata_file_index,
+            "meta/episodes/file_index": 0,
         }
 
-        start_ts = row["dataset_from_index"] / fps
-        end_ts = row["dataset_to_index"] / fps
         for video_key in video_keys:
-            row[f"videos/{video_key}/chunk_index"] = 0
-            row[f"videos/{video_key}/file_index"] = 0
-            row[f"videos/{video_key}/from_timestamp"] = start_ts
-            row[f"videos/{video_key}/to_timestamp"] = end_ts
+            segment = _find_video_segment(
+                video_segments[video_key],
+                episode_index=row["episode_index"],
+                video_key=video_key,
+                start_frame=row["dataset_from_index"],
+                end_frame=row["dataset_to_index"],
+            )
+            row[f"videos/{video_key}/chunk_index"] = segment["chunk_index"]
+            row[f"videos/{video_key}/file_index"] = segment["file_index"]
+            row[f"videos/{video_key}/from_timestamp"] = (
+                row["dataset_from_index"] - segment["start_frame"]
+            ) / fps
+            row[f"videos/{video_key}/to_timestamp"] = (row["dataset_to_index"] - segment["start_frame"]) / fps
 
         rows.append(row)
 
-    episodes_dir.mkdir(parents=True, exist_ok=True)
-    for row in rows:
-        out_path = episodes_dir / "chunk-000" / f"file-{row['meta/episodes/file_index']:03d}.parquet"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pylist([row]), out_path)
+    out_path = episodes_dir / "chunk-000" / "file-000.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(rows), out_path, compression="snappy")
 
     log.info("Rebuilt local LeRobot episode metadata at %s", episodes_dir)
 

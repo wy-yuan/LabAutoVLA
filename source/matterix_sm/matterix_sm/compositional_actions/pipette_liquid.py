@@ -3,227 +3,84 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""PipetteLiquid compositional action - pick up a pipette and transfer liquid between containers."""
+"""Pipette liquid-transfer workflow built on the reusable pipette-picking action."""
 
 from __future__ import annotations
 
 from dataclasses import MISSING
 
 from .._compat import configclass
-from ..compositional_action import CompositionalActionCfg
-from ..primitive_actions import (
-    OpenGripperCfg,
-    CloseGripperCfg,
-    MoveRelativeCfg,
-    MoveToFrameCfg,
-)
-from ..robot_action_spaces import ActionSpaceInfo
-from .pick_object import PickObjectCfg
-
-
-def _relaxed_move_to_frame(
-    object: str,
-    frame: str,
-    agent_assets,
-    action_space_info,
-    interpolation_duration: float = 0.0,
-    position_noise_range: dict[str, tuple[float, float]] | None = None,
-) -> MoveToFrameCfg:
-    """Create a MoveToFrameCfg with relaxed thresholds for pipetting tasks."""
-    cfg = MoveToFrameCfg()
-    cfg.object = object
-    cfg.frame = frame
-    cfg.agent_assets = agent_assets
-    cfg.action_space_info = action_space_info
-    cfg.position_threshold = 0.02      # 20mm (default: 10mm)
-    cfg.orientation_threshold = 0.1    # ~5.7° (default: ~1.15°)
-    cfg.interpolation_duration = interpolation_duration
-    cfg.position_noise_range = position_noise_range
-    return cfg
+from ..primitive_actions import MoveRelativeCfg, MoveToFrameCfg
+from .picking_pipette import PickingPipetteCfg
 
 
 @configclass
-class PipetteLiquidCfg(CompositionalActionCfg):
-    """Configuration for PipetteLiquid compositional action.
+class PipetteLiquidCfg(PickingPipetteCfg):
+    """Pick up a pipette, dip into the source, and dip into the target.
 
-    Transfers liquid from a source container to a target container using a pipette.
+    The source and target assets must define a "liquid_approach" frame above
+    their openings. Picking motion, gripper interpolation, and picking noise
+    settings are inherited from PickingPipetteCfg.
 
-    Full sequence:
-        PickObject(pipette)
-        → MoveToFrame(source, "liquid_approach")   # position EE above source opening
-        → MoveRelative(-aspirate_depth in z)        # lower tip into liquid
-        → CloseGripper(aspirate_duration)           # hold — aspirate wait
-        → MoveRelative(+lift_height in z)           # lift tip clear of source
-        → MoveToFrame(target, "liquid_approach")   # position EE above target opening
-        → MoveRelative(-dispense_depth in z)        # lower tip into target
-        → CloseGripper(dispense_duration)           # hold — dispense wait
-        → MoveRelative(+lift_height in z)           # lift tip clear of target
-
-    The source and target beaker assets must define a "liquid_approach" frame that
-    positions the robot EE above the container opening, at the correct height for
-    the pipette tip to reach the liquid surface after the aspirate/dispense dip.
-
-    Attributes:
-        agent_assets: Name of the robot executing the workflow. REQUIRED.
-        pipette: Name of the pipette object in the scene. REQUIRED.
-        source: Name of the source (liquid donor) container. REQUIRED.
-        target: Name of the target (liquid recipient) container. REQUIRED.
-        aspirate_depth: Downward dip distance (m) into the source liquid. Default: 0.05.
-        dispense_depth: Downward dip distance (m) into the target container. Default: 0.05.
-        aspirate_duration: Time (s) to hold at the source dip position. Default: 1.5.
-        dispense_duration: Time (s) to hold at the target dip position. Default: 1.5.
-        lift_height: Upward clearance (m) after each dip. Default: 0.08.
-        interpolation_duration: Time (s) to ramp each move primitive from current pose to target.
-        gripper_interpolation_duration: Time (s) to ramp open/close gripper commands.
-        action_space_info: Action space metadata for the robot. REQUIRED.
+    "aspirate_duration" and "dispense_duration" remain available for
+    configuration compatibility; the current workflow has no hold primitives.
     """
 
-    # Required fields
-    agent_assets: str | list[str] = MISSING
-    pipette: str = MISSING
     source: str = MISSING
     target: str = MISSING
-    action_space_info: ActionSpaceInfo | None = None
 
-    # Tunable motion parameters
-    aspirate_depth: float = 0.25      # m — how far to dip into source liquid
-    dispense_depth: float = 0.25      # m — how far to dip into target
-    aspirate_duration: float = 1.5    # s — hold time to simulate aspiration
-    dispense_duration: float = 1.5    # s — hold time to simulate dispensing
-    lift_height: float = 0.15         # m — clearance height after each dip
-
-    interpolation_duration: float = 0.8  # s — time to ramp each move from current to target pose
-    gripper_interpolation_duration: float = 1.2  # s — time to ramp gripper commands
-
-    pre_grasp_position_noise_range: dict[str, tuple[float, float]] | None = {
-        "x": (-0.01, 0.01),
-        "y": (-0.01, 0.01),
-        "z": (-0.07, 0.07),
-    }
-    post_grasp_position_noise_range: dict[str, tuple[float, float]] | None = {
-        "x": (-0.01, 0.01),
-        "y": (-0.01, 0.01),
-        "z": (-0.07, 0.07),
-    }
+    aspirate_depth: float = 0.25
+    dispense_depth: float = 0.25
+    aspirate_duration: float = 1.5
+    dispense_duration: float = 1.5
+    lift_height: float = 0.15
 
     def __post_init__(self):
-        """Build the 9-step primitive action sequence after field initialisation."""
+        """Build the picking prefix, then append the liquid-transfer actions."""
         super().__post_init__()
-
-        self.sub_actions = [
-            # ── Step 1: Pick up the pipette ──────────────────────────────────
-            # PickObjectCfg(
-            #     description="Pick up pipette from rack",
-            #     agent_assets=self.agent_assets,
-            #     object=self.pipette,
-            #     action_space_info=self.action_space_info,
-            # ),
-             
-            _relaxed_move_to_frame(
-                object=self.pipette,
-                frame="pre_grasp",
-                agent_assets=self.agent_assets,
-                action_space_info=self.action_space_info,
-                interpolation_duration=self.interpolation_duration,
-                position_noise_range=self.pre_grasp_position_noise_range,
-            ),
-
-            OpenGripperCfg(
-                # target_value=0.1, # open gripper to 20% for pick-up
-                agent_assets=self.agent_assets,
-                duration=0.5,
-                interpolation_duration=self.gripper_interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-
-            _relaxed_move_to_frame(
-                object=self.pipette,
-                frame="grasp",
-                agent_assets=self.agent_assets,
-                action_space_info=self.action_space_info,
-                interpolation_duration=self.interpolation_duration,
-            ),
-            CloseGripperCfg(
-                agent_assets=self.agent_assets,
-                duration=0.5,
-                interpolation_duration=self.gripper_interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-            _relaxed_move_to_frame(
-                object=self.pipette,
-                frame="post_grasp",
-                agent_assets=self.agent_assets,
-                action_space_info=self.action_space_info,
-                interpolation_duration=self.interpolation_duration,
-                position_noise_range=self.post_grasp_position_noise_range,
-            ),
-
-            # ── Step 2: Move above source container ──────────────────────────
-            MoveToFrameCfg(
-                object=self.source,
-                frame="liquid_approach",
-                agent_assets=self.agent_assets,
-                interpolation_duration=self.interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-
-            # # ── Step 3: Lower tip into source liquid ─────────────────────────
-            MoveRelativeCfg(
-                agent_assets=self.agent_assets,
-                position_offset=(0.0, 0.0, -self.aspirate_depth),
-                orientation_offset=None,
-                interpolation_duration=self.interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-
-            # # ── Step 4: Hold position — simulate aspiration ──────────────────
-            # # Keeps the gripper closed (holds the pipette) for aspirate_duration.
-            # CloseGripperCfg(
-            #     agent_assets=self.agent_assets,
-            #     duration=self.aspirate_duration,
-            #     action_space_info=self.action_space_info,
-            # ),
-
-            # # ── Step 5: Lift tip clear of source ─────────────────────────────
-            MoveRelativeCfg(
-                agent_assets=self.agent_assets,
-                position_offset=(0.0, 0.0, self.lift_height),
-                orientation_offset=None,
-                interpolation_duration=self.interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-
-            # # ── Step 6: Move above target container ──────────────────────────
-            MoveToFrameCfg(
-                object=self.target,
-                frame="liquid_approach",
-                agent_assets=self.agent_assets,
-                interpolation_duration=self.interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-
-            # # ── Step 7: Lower tip into target ────────────────────────────────
-            MoveRelativeCfg(
-                agent_assets=self.agent_assets,
-                position_offset=(0.0, 0.0, -self.dispense_depth),
-                orientation_offset=None,
-                interpolation_duration=self.interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-
-            # # ── Step 8: Hold position — simulate dispensing ──────────────────
-            # CloseGripperCfg(
-            #     agent_assets=self.agent_assets,
-            #     duration=self.dispense_duration,
-            #     action_space_info=self.action_space_info,
-            # ),
-
-            # # ── Step 9: Lift tip clear of target ─────────────────────────────
-            MoveRelativeCfg(
-                agent_assets=self.agent_assets,
-                position_offset=(0.0, 0.0, self.lift_height),
-                orientation_offset=None,
-                interpolation_duration=self.interpolation_duration,
-                action_space_info=self.action_space_info,
-            ),
-        ]
+        self.sub_actions.extend(
+            [
+                MoveToFrameCfg(
+                    object=self.source,
+                    frame="liquid_approach",
+                    agent_assets=self.agent_assets,
+                    interpolation_duration=self.interpolation_duration,
+                    action_space_info=self.action_space_info,
+                ),
+                MoveRelativeCfg(
+                    agent_assets=self.agent_assets,
+                    position_offset=(0.0, 0.0, -self.aspirate_depth),
+                    orientation_offset=None,
+                    interpolation_duration=self.interpolation_duration,
+                    action_space_info=self.action_space_info,
+                ),
+                MoveRelativeCfg(
+                    agent_assets=self.agent_assets,
+                    position_offset=(0.0, 0.0, self.lift_height),
+                    orientation_offset=None,
+                    interpolation_duration=self.interpolation_duration,
+                    action_space_info=self.action_space_info,
+                ),
+                MoveToFrameCfg(
+                    object=self.target,
+                    frame="liquid_approach",
+                    agent_assets=self.agent_assets,
+                    interpolation_duration=self.interpolation_duration,
+                    action_space_info=self.action_space_info,
+                ),
+                MoveRelativeCfg(
+                    agent_assets=self.agent_assets,
+                    position_offset=(0.0, 0.0, -self.dispense_depth),
+                    orientation_offset=None,
+                    interpolation_duration=self.interpolation_duration,
+                    action_space_info=self.action_space_info,
+                ),
+                MoveRelativeCfg(
+                    agent_assets=self.agent_assets,
+                    position_offset=(0.0, 0.0, self.lift_height),
+                    orientation_offset=None,
+                    interpolation_duration=self.interpolation_duration,
+                    action_space_info=self.action_space_info,
+                ),
+            ]
+        )

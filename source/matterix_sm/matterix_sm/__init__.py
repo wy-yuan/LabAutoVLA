@@ -32,6 +32,7 @@ from .compositional_actions import (
     CompositionalAction,
     CompositionalActionCfg,
     PickObjectCfg,
+    PickingPipetteCfg,
     PipetteLiquidCfg,
 )
 
@@ -87,5 +88,6 @@ __all__ = [
     "CompositionalAction",
     "CompositionalActionCfg",
     "PickObjectCfg",
+    "PickingPipetteCfg",
     "PipetteLiquidCfg",
 ]

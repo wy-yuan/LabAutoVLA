@@ -15,6 +15,7 @@ Each compositional action is paired with its configuration class
 
 from ..compositional_action import CompositionalAction, CompositionalActionCfg
 from .pick_object import PickObjectCfg
+from .picking_pipette import PickingPipetteCfg
 from .pipette_liquid import PipetteLiquidCfg
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "CompositionalActionCfg",
     # Specific compositional action configs
     "PickObjectCfg",
+    "PickingPipetteCfg",
     "PipetteLiquidCfg",
 ]

@@ -16,7 +16,7 @@ from matterix_assets.labware.beakers import BEAKER_500ML_INST_CFG
 from matterix_assets.labware.pipettes import PIPETTE_1ML_INST_CFG, PIPETTE_RACK_CFG
 from matterix_assets.robots import FRANKA_PANDA_HIGH_PD_IK_CFG
 
-from matterix_sm import PipetteLiquidCfg
+from matterix_sm import PickingPipetteCfg, PipetteLiquidCfg
 from matterix_sm.robot_action_spaces import FRANKA_IK_ACTION_SPACE
 
 import isaaclab.envs.mdp as isaaclab_mdp
@@ -275,6 +275,8 @@ class ObservationManagerCfg:
         robot__joint_vel = ObsTerm(func=mdp.joint_vel, params={"asset_name": "robot"})
         robot__ee_world_pos = ObsTerm(func=mdp.ee_world_pos, params={"asset_name": "robot"})
         robot__ee_world_quat = ObsTerm(func=mdp.ee_world_quat, params={"asset_name": "robot"})
+        robot__ee_base_pos = ObsTerm(func=mdp.ee_base_pos, params={"asset_name": "robot"})
+        robot__ee_base_quat = ObsTerm(func=mdp.ee_base_quat, params={"asset_name": "robot"})
         robot__gripper_pos = ObsTerm(func=mdp.gripper_pos, params={"asset_name": "robot"})
 
         def __post_init__(self):
@@ -443,9 +445,8 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
 
     gripper_joint_names = ["panda_finger_joint1", "panda_finger_joint2"]
 
-    # Re-render after resets so the camera sees the freshly-reset scene
-    rerender_on_reset = True
-    num_rerenders_on_reset: int = 1   # or 0 if you don't need extra renders after reset
+    # Advance one rendered simulation tick after reset so RTX cameras see the reset state.
+    num_rerenders_on_reset: int = 1
 
     observations = ObservationManagerCfg()
     events = EventCfg()
@@ -454,6 +455,12 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
 
     # ── Workflows ────────────────────────────────────────────────────────────
     workflows = {
+        "picking_pipette": PickingPipetteCfg(
+            description="Pick up the pipette from the rack.",
+            agent_assets="robot",
+            pipette="pipette",
+            action_space_info=FRANKA_IK_ACTION_SPACE,
+        ),
         "pipette_liquid": PipetteLiquidCfg(
             description=(
                 "Pick up the pipette, aspirate from the source beaker, "

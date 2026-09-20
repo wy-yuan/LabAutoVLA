@@ -66,7 +66,7 @@ def _launch_sim_app():
     print("[evaluate] Launching Isaac Sim for evaluation...", flush=True)
     from isaaclab.app import AppLauncher
 
-    _app_launcher = AppLauncher(headless=True, enable_cameras=True, livestream=2)
+    _app_launcher = AppLauncher(headless=True, enable_cameras=True, livestream=0)
     simulation_app = _app_launcher.app
     print("[evaluate] Isaac Sim launcher returned control.", flush=True)
     return simulation_app

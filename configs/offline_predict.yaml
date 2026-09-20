@@ -19,9 +19,9 @@ defaults:
 device: "cuda:0"
 
 dataset:
-  root: data/datasets/pipetting_v2_ep50
-  repo_id: local/pipetting_v2_ep50
-  fps: 30
+  root: data/datasets/picking_v3_dec10_ep50_envs10
+  repo_id: local/picking_v3_dec10_ep50_envs10
+  fps: 60
   action_chunk_size: 50
 
 # Must match bc_train split so val set is identical to training holdout
