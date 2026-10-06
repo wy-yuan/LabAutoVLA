@@ -23,7 +23,12 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from vla.data.obs_adapter import ObsAdapterConfig, build_vla_inputs
+from vla.data.obs_adapter import (
+    COMPACT_EE_STATE_DIM,
+    ObsAdapterConfig,
+    build_vla_inputs,
+    compose_state_from_position_buffer,
+)
 from vla.models.smolvla import action_to_env_action
 
 
@@ -41,13 +46,14 @@ class VLAEnvWrapper(gym.Wrapper):
         self.adapter_cfg = adapter_cfg
         self.task_prompt = task_prompt
         self.render_camera_key = render_camera_key
+        self._position_history: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # gym API
     # ------------------------------------------------------------------
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        return self._adapt(obs), info
+        return self._adapt(obs, history_mode="reset"), info
 
     def step(self, action):
         # Matterix envs return (obs, reward, terminated, truncated, info).
@@ -69,8 +75,79 @@ class VLAEnvWrapper(gym.Wrapper):
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _adapt(self, raw_obs: Mapping[str, Any]) -> dict[str, Any]:
+    def reset_state_history(self, raw_obs: Mapping[str, Any]) -> None:
+        """Reset online history from a raw observation without decoding images."""
+        compact_state = self._compact_state(raw_obs)
+        self._reset_position_history(compact_state)
+
+    def observe_raw_state(self, raw_obs: Mapping[str, Any]) -> None:
+        """Append a raw observation to history during a scripted prefix."""
+        compact_state = self._compact_state(raw_obs)
+        self._append_position_history(compact_state)
+
+    def adapt_current(self, raw_obs: Mapping[str, Any]) -> dict[str, Any]:
+        """Adapt an already-observed raw frame without appending it twice."""
+        return self._adapt(raw_obs, history_mode="current")
+
+    def _compact_state(self, raw_obs: Mapping[str, Any]) -> torch.Tensor:
+        state_parts = []
+        for path in self.adapter_cfg.state_keys:
+            value: Any = raw_obs
+            for part in path.split("/"):
+                value = value[part]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"Observation state '{path}' is not a tensor")
+            state_parts.append(value if value.ndim == 2 else value.unsqueeze(-1))
+        state = torch.cat(state_parts, dim=-1).float()
+        if self.adapter_cfg.position_history_offsets and state.shape[-1] != COMPACT_EE_STATE_DIM:
+            raise ValueError(
+                "Position history requires compact 9D state before augmentation, "
+                f"got {tuple(state.shape)}"
+            )
+        return state
+
+    def _reset_position_history(self, compact_state: torch.Tensor) -> None:
+        offsets = self.adapter_cfg.position_history_offsets
+        if not offsets:
+            self._position_history = None
+            return
+        history_len = offsets[-1] + 1
+        self._position_history = compact_state[:, None, :3].repeat(1, history_len, 1)
+
+    def _append_position_history(self, compact_state: torch.Tensor) -> None:
+        if not self.adapter_cfg.position_history_offsets:
+            return
+        if self._position_history is None:
+            self._reset_position_history(compact_state)
+            return
+        self._position_history = torch.cat(
+            [self._position_history[:, 1:], compact_state[:, None, :3]], dim=1
+        )
+
+    def _adapt(
+        self,
+        raw_obs: Mapping[str, Any],
+        *,
+        history_mode: str = "append",
+    ) -> dict[str, Any]:
         num_envs = self.env.unwrapped.num_envs
-        return build_vla_inputs(
+        inputs = build_vla_inputs(
             raw_obs, self.adapter_cfg, task=self.task_prompt, num_envs=num_envs
         )
+        compact_state = inputs["state"].float()
+        if history_mode == "reset":
+            self._reset_position_history(compact_state)
+        elif history_mode == "append":
+            self._append_position_history(compact_state)
+        elif history_mode != "current":
+            raise ValueError(f"Unknown history mode: {history_mode}")
+
+        if self.adapter_cfg.position_history_offsets:
+            if self._position_history is None:
+                raise RuntimeError("Position history has not been initialized")
+            inputs["state"] = compose_state_from_position_buffer(
+                self._position_history,
+                compact_state,
+                self.adapter_cfg.position_history_offsets,
+            )
+        return inputs

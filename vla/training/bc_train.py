@@ -40,7 +40,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Subset
 
-from vla.data.obs_adapter import ObsAdapterConfig
+from vla.data.obs_adapter import COMPACT_EE_STATE_DIM, ObsAdapterConfig, model_state_dim
 log = logging.getLogger(__name__)
 
 _app_launcher = None
@@ -307,7 +307,7 @@ def _ensure_local_episode_metadata(root: Path, fps: int) -> None:
     log.info("Rebuilt local LeRobot episode metadata at %s", episodes_dir)
 
 
-def _build_dataset(cfg: DictConfig):
+def _build_dataset(cfg: DictConfig, adapter_cfg: ObsAdapterConfig | None = None):
     """Load a LeRobotDataset. If it doesn't exist, convert from HDF5."""
     log.info("Preparing LeRobot dataset from root=%s", cfg.dataset.root)
     try:
@@ -325,6 +325,7 @@ def _build_dataset(cfg: DictConfig):
             task=cfg.task.prompt,
             fps=cfg.dataset.fps,
             repo_id=cfg.dataset.repo_id,
+            adapter_cfg=adapter_cfg,
         )
 
     # Some locally converted datasets may be missing meta/episodes, which
@@ -907,7 +908,7 @@ def run_bc(cfg: DictConfig) -> None:
     # -- Dataset -------------------------------------------------------
     log.info("Building training dataset")
     print("[bc_train] Building training dataset", flush=True)
-    dataset = _build_dataset(cfg)
+    dataset = _build_dataset(cfg, adapter_cfg=adapter_cfg)
     train_dataset, val_dataset = _split_train_val_dataset(
         dataset,
         val_fraction=float(cfg.mode.get("validation_fraction", 0.1)),
@@ -960,12 +961,14 @@ def run_bc(cfg: DictConfig) -> None:
             f"but dataset action_dim={raw_action_dim}. Regenerate/reconvert the dataset "
             "with data.generate_dataset after the base-frame action patch."
         )
-    if state_dim != 9:
+    expected_state_dim = model_state_dim(
+        COMPACT_EE_STATE_DIM, adapter_cfg.position_history_offsets
+    )
+    if state_dim != expected_state_dim:
         raise ValueError(
-            "Expected compact 9D observation.state "
-            "[ee_pos(3), ee_quat(4), gripper_pos(2)], "
-            f"but dataset state_dim={state_dim}. Regenerate/reconvert the dataset "
-            "with the updated task adapter."
+            f"Task adapter expects state_dim={expected_state_dim} with position history "
+            f"offsets={list(adapter_cfg.position_history_offsets)}, but dataset state_dim={state_dim}. "
+            "Regenerate/reconvert the LeRobot dataset with the same task adapter."
         )
     image_keys = [
         k.replace("observation.images.", "")

@@ -205,6 +205,14 @@ class MatterixBaseEnvCfg:
 
     """
 
+    num_rerenders_on_reset: int = 1
+    """Number of RTX render passes performed after reset.
+
+    The first pass advances one simulation tick so teleported articulation and
+    particle state reaches PhysX/Fabric. Any remaining passes are render-only
+    warm-up frames used to flush temporal renderer history such as DLSS.
+    """
+
     wait_for_textures: bool = True
     """True to wait for assets to be loaded completely, False otherwise. Defaults to True."""
 

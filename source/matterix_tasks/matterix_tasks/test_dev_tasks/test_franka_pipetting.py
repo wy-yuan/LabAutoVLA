@@ -203,6 +203,7 @@ class EventCfg(EventManagerCfg):
     reset_scene_to_default = EventTerm(
         func=isaaclab_mdp.reset_scene_to_default,
         mode="reset",
+        params={"reset_joint_targets": True},
     )
 
     # Randomise beaker positions slightly so the workflow must generalise
@@ -211,8 +212,8 @@ class EventCfg(EventManagerCfg):
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.05, 0.05),
-                "y": (-0.05, 0.05),
+                "x": (-0.03, 0.03),
+                "y": (-0.03, 0.03),
                 "z": (0.0, 0.0),
             },
             "velocity_range": {},
@@ -225,8 +226,8 @@ class EventCfg(EventManagerCfg):
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.05, 0.05),
-                "y": (-0.05, 0.05),
+                "x": (-0.03, 0.03),
+                "y": (-0.03, 0.03),
                 "z": (0.0, 0.0),
             },
             "velocity_range": {},
@@ -239,8 +240,8 @@ class EventCfg(EventManagerCfg):
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.05, 0.05),
-                "y": (-0.05, 0.05),
+                "x": (-0.03, 0.03),
+                "y": (-0.03, 0.03),
                 "z": (0.0, 0.0),
             },
         },
@@ -385,8 +386,8 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
         # "pipette_rack": PIPETTE_RACK_CFG(pos=(0.65, -0.3, 0.0)),
         "pipette": PIPETTE_1ML_INST_CFG(pos=(0.55, -0.2, 0.05)),
         "pipette_rack": PIPETTE_RACK_CFG(pos=(0.55, -0.2, 0.0)),
-        "source_beaker": BEAKER_SOURCE_CFG(pos=(0.6, 0.2, 0.05)),
-        "target_beaker": BEAKER_TARGET_CFG(pos=(0.6, 0.0, 0.05)),
+        "source_beaker": BEAKER_SOURCE_CFG(pos=(0.6, 0.0, 0.05)),
+        "target_beaker": BEAKER_TARGET_CFG(pos=(0.6, 0.2, 0.05)),
         "table": TABLE_SEATTLE_INST_Cfg(pos=(0.5, 0.0, 0.0)),
     }
 
@@ -400,7 +401,7 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
     # pos is in world frame; volume (x, y, z) fills the beaker interior.
     particle_systems = {
         "source_fluid": FluidCfg(
-            pos=(0.6, 0.2, 0.01),          # centered inside the source beaker
+            pos=(0.6, 0.0, 0.01),          # centered inside the source beaker
             volume=(0.02, 0.02, 0.03),      # ~96 mL block of fluid
         ),
     }
@@ -445,8 +446,9 @@ class FrankaPipettingEnvTestCfg(MatterixBaseEnvCfg):
 
     gripper_joint_names = ["panda_finger_joint1", "panda_finger_joint2"]
 
-    # Advance one rendered simulation tick after reset so RTX cameras see the reset state.
-    num_rerenders_on_reset: int = 1
+    # One physics+render pass updates reset transforms; seven render-only passes
+    # flush DLSS temporal history before the first policy observation is returned.
+    num_rerenders_on_reset: int = 8
 
     observations = ObservationManagerCfg()
     events = EventCfg()

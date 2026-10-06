@@ -60,6 +60,17 @@ class MoveToPoseCfg(PrimitiveActionCfg):
                       Prevents false positives from overshoots or oscillations.
         interpolation_duration: Time (in seconds) used to ramp from the current EE pose to
                       the target pose. A value of 0.0 preserves the old immediate-target behavior.
+                      Ignored when target_velocity is set.
+        target_velocity: Optional constant end-effector speed (m/s). When set, the actual
+                      interpolation_duration is derived at runtime from the start-to-target
+                      distance (duration = distance / target_velocity) instead of using the
+                      fixed interpolation_duration above, so commanded speed stays constant
+                      even when the target position is randomized. Clamped to
+                      [min_interp_duration, max_interp_duration].
+        min_interp_duration: Lower bound (seconds) applied when deriving duration from
+                      target_velocity.
+        max_interp_duration: Upper bound (seconds) applied when deriving duration from
+                      target_velocity.
     """
 
     target_positions: torch.Tensor | None = None
@@ -68,6 +79,9 @@ class MoveToPoseCfg(PrimitiveActionCfg):
     orientation_threshold: float = 0.02  # ~1.15 degrees tolerance (realistic for IK)
     settling_time: float = 0.05  # 50ms default (tunable per task)
     interpolation_duration: float = 0.0
+    target_velocity: float | None = None
+    min_interp_duration: float = 0.1
+    max_interp_duration: float = 5.0
 
 
 class MoveToPose(PrimitiveAction):
@@ -93,6 +107,9 @@ class MoveToPose(PrimitiveAction):
         orientation_threshold: float,
         settling_time: float = 0.05,
         interpolation_duration: float = 0.0,
+        target_velocity: float | None = None,
+        min_interp_duration: float = 0.1,
+        max_interp_duration: float = 5.0,
         action_space_info: ActionSpaceInfo | None = None,
     ):
         """
@@ -107,6 +124,11 @@ class MoveToPose(PrimitiveAction):
             orientation_threshold: Orientation threshold for success (radians).
             settling_time: Time (in seconds) the robot must remain within threshold before success.
             interpolation_duration: Time in seconds to ramp the commanded pose from current to target.
+                                   Ignored when target_velocity is set.
+            target_velocity: Optional constant end-effector speed (m/s) used to derive
+                            interpolation_duration from the runtime start-to-target distance.
+            min_interp_duration: Lower bound (seconds) for the derived duration.
+            max_interp_duration: Upper bound (seconds) for the derived duration.
             action_space_info: Optional action space metadata for mask creation.
         """
         super().__init__(agent_assets, timeout, action_space_info)
@@ -123,13 +145,19 @@ class MoveToPose(PrimitiveAction):
         self.target_positions_w = None
         self.target_orientations_w = None
 
-        # Initialize flag for lazy target initialization
-        self._targets_initialized = False
-
         self.position_threshold = position_threshold
         self.orientation_threshold = orientation_threshold
         self.settling_time = settling_time
+        # Base (per-config, not per-env) duration; converted to a per-env tensor in
+        # set_execution_params() so target_velocity can derive a distinct duration per env.
         self.interpolation_duration = interpolation_duration
+        self.target_velocity = target_velocity
+        self.min_interp_duration = min_interp_duration
+        self.max_interp_duration = max_interp_duration
+        # Whether this action ramps at all -- a static, per-config decision (not per-env),
+        # so it's safe to use directly in an `if` even once interpolation_duration becomes
+        # a per-env tensor below.
+        self._use_interpolation = (target_velocity is not None) or (interpolation_duration > 0.0)
 
         # Settling time tracking (initialized in set_execution_params)
         self.time_in_threshold = None
@@ -161,7 +189,10 @@ class MoveToPose(PrimitiveAction):
         """Set execution parameters and initialize move-specific tensors."""
         super().set_execution_params(num_envs, device, dt)
 
-        # Validate and move target tensors to device
+        # Validate and move target tensors to device. When a target wasn't provided at
+        # construction time, allocate a real (num_envs, ...) placeholder -- rather than
+        # leaving it as a bare None -- so it can be filled in per-env (see _targets_initialized_mask
+        # below) instead of racing across environments that reach this action at different times.
         if self._target_positions_w_init is not None:
             assert self._target_positions_w_init.shape == (
                 num_envs,
@@ -169,7 +200,7 @@ class MoveToPose(PrimitiveAction):
             ), f"target_positions_w must have shape (num_envs, 3), got {self._target_positions_w_init.shape}"
             self.target_positions_w = self._target_positions_w_init.to(self.device)
         else:
-            self.target_positions_w = None
+            self.target_positions_w = torch.zeros((num_envs, 3), device=self.device)
 
         if self._target_orientations_w_init is not None:
             assert self._target_orientations_w_init.shape == (
@@ -178,7 +209,32 @@ class MoveToPose(PrimitiveAction):
             ), f"target_orientations_w must have shape (num_envs, 4), got {self._target_orientations_w_init.shape}"
             self.target_orientations_w = self._target_orientations_w_init.to(self.device)
         else:
-            self.target_orientations_w = None
+            self.target_orientations_w = torch.zeros((num_envs, 4), device=self.device)
+            self.target_orientations_w[:, 0] = 1.0  # identity quaternion placeholder
+
+        # Per-env flag: has this env's target_positions_w/target_orientations_w been resolved
+        # for the current activation of this action? Environments run this state machine
+        # asynchronously (each env has its own current_action_idx in StateMachine), so this
+        # MUST be tracked per env rather than as a single shared flag -- otherwise whichever
+        # env reaches this action first would latch a target/start pose for every env, using
+        # the OTHER (not-yet-arrived) envs' stale current pose from an earlier action.
+        # Subclasses (MoveToFrame, MoveRelative) that resolve target_positions_w themselves
+        # (frame lookup, offset) share this same mask: they mark env ids as initialized once
+        # they've written the target, which causes the generic fallback below to skip them.
+        self._targets_initialized_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        if self._target_positions_w_init is not None and self._target_orientations_w_init is not None:
+            # Both targets were fully specified at construction time (same for every env);
+            # nothing left to lazily resolve.
+            self._targets_initialized_mask[:] = True
+
+        # Interpolation start pose and per-env derived duration, same per-env-latch reasoning
+        # as _targets_initialized_mask above.
+        self._interp_start_positions_w = torch.zeros((num_envs, 3), device=self.device)
+        self._interp_start_orientations_w = torch.zeros((num_envs, 4), device=self.device)
+        self._interp_initialized_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self.interpolation_duration = torch.full(
+            (num_envs,), float(self.interpolation_duration), dtype=torch.float32, device=self.device
+        )
 
         # Cache the action dimension mask (computed once, reused every step)
         self._action_dim_mask = self._create_action_mask("position_orientation")
@@ -220,33 +276,56 @@ class MoveToPose(PrimitiveAction):
         robot_data = scene_data.articulations[self._asset_name]
         timings["data_access"] = time.perf_counter() - data_access_start
 
-        # On first call, fill in None values with current robot pose
-        # This allows partial specification (e.g., move position only, keep current orientation)
+        # For envs newly entering this action (i.e. not yet resolved for this activation),
+        # fill in any target left unspecified at construction time, using THEIR OWN current
+        # pose. Only touches env_ids currently active on this action -- see
+        # _targets_initialized_mask setup in set_execution_params for why this must be
+        # per-env rather than a single shared flag.
         init_start = time.perf_counter()
-        if not hasattr(self, "_targets_initialized") or not self._targets_initialized:
-            if self.target_positions_w is None:
-                # Use current EE position if not specified
+        newly_targeted = env_ids[~self._targets_initialized_mask[env_ids]]
+        if newly_targeted.numel() > 0:
+            if self._position_was_none:
                 if robot_data.ee_pos_w is None:
                     raise ValueError(f"End-effector position not available for asset '{self._asset_name}'")
-                self.target_positions_w = robot_data.ee_pos_w.to(self.device).clone()
+                self.target_positions_w[newly_targeted] = robot_data.ee_pos_w[newly_targeted].to(self.device)
 
-            if self.target_orientations_w is None:
-                # Use current EE orientation if not specified
+            if self._orientation_was_none:
                 if robot_data.ee_quat_w is None:
                     raise ValueError(f"End-effector orientation not available for asset '{self._asset_name}'")
-                self.target_orientations_w = robot_data.ee_quat_w.to(self.device).clone()
+                self.target_orientations_w[newly_targeted] = robot_data.ee_quat_w[newly_targeted].to(self.device)
 
-            self._targets_initialized = True
+            self._targets_initialized_mask[newly_targeted] = True
         timings["target_init"] = time.perf_counter() - init_start
 
         # Optional command interpolation. The success check still uses the final
         # target, while the IK command ramps smoothly toward that target.
         command_positions_w = self.target_positions_w
         command_orientations_w = self.target_orientations_w
-        if self.interpolation_duration > 0.0:
-            if self._interp_start_positions_w is None:
-                self._interp_start_positions_w = robot_data.ee_pos_w.to(self.device).clone()
-                self._interp_start_orientations_w = robot_data.ee_quat_w.to(self.device).clone()
+        if self._use_interpolation:
+            # Capture each env's interpolation start pose exactly when IT first becomes
+            # active on this action (env_ids), not whenever the first env in the whole
+            # batch happens to reach it -- environments advance through the action
+            # sequence asynchronously (see StateMachine.step()), so a shared/global latch
+            # would capture late-arriving envs' stale mid-previous-action pose instead.
+            newly_started = env_ids[~self._interp_initialized_mask[env_ids]]
+            if newly_started.numel() > 0:
+                self._interp_start_positions_w[newly_started] = robot_data.ee_pos_w[newly_started].to(self.device)
+                self._interp_start_orientations_w[newly_started] = robot_data.ee_quat_w[newly_started].to(
+                    self.device
+                )
+
+                if self.target_velocity is not None:
+                    # Derive duration from the actual start-to-target distance so the
+                    # commanded speed (and resulting tracking lag) stays constant even
+                    # when the target position is randomized (e.g. position_noise_range).
+                    distance = (
+                        self.target_positions_w[newly_started] - self._interp_start_positions_w[newly_started]
+                    ).norm(dim=-1)
+                    self.interpolation_duration[newly_started] = (distance / self.target_velocity).clamp(
+                        self.min_interp_duration, self.max_interp_duration
+                    )
+
+                self._interp_initialized_mask[newly_started] = True
 
             alpha = ((self.time_elapsed - self.dt) / self.interpolation_duration).clamp(0.0, 1.0)
             alpha_pos = alpha.unsqueeze(-1)
@@ -315,16 +394,17 @@ class MoveToPose(PrimitiveAction):
             scene_data: Complete scene state container.
             env_ids: Indices of active environments.
         """
-        # Skip checking if targets not initialized yet
-        # This happens when targets were None and haven't been filled from robot state yet
-        if (
-            not hasattr(self, "target_positions_w")
-            or not hasattr(self, "target_orientations_w")
-            or self.target_positions_w is None
-            or self.target_orientations_w is None
-        ):
-            self._env_success_mask[env_ids] = False
-            self._env_failure_mask[env_ids] = False
+        # Skip checking envs whose target hasn't been resolved yet this activation (their
+        # first step on this action: _compute_action_impl resolves the target AFTER this
+        # method runs, see PrimitiveAction.compute_action). Per-env, since other envs may
+        # already be mid-motion on this same action instance.
+        uninitialized_env_ids = env_ids[~self._targets_initialized_mask[env_ids]]
+        if uninitialized_env_ids.numel() > 0:
+            self._env_success_mask[uninitialized_env_ids] = False
+            self._env_failure_mask[uninitialized_env_ids] = False
+
+        env_ids = env_ids[self._targets_initialized_mask[env_ids]]
+        if env_ids.numel() == 0:
             return
 
         # Get robot articulation data
@@ -376,35 +456,23 @@ class MoveToPose(PrimitiveAction):
         self._env_failure_mask[env_ids] = False
 
     def _reset_impl(self, env_ids: torch.Tensor | None = None) -> None:
-        """Reset target initialization flag and settling timers when environments are reset.
+        """Reset per-env initialization flags and settling timers for the given environments.
 
-        This ensures that if targets were None, they'll be re-initialized
-        from the new post-reset robot pose.
+        Only touches the given env_ids (or all envs, if None) -- this must stay per-env
+        so that resetting some environments (e.g. one env finishing/restarting an episode)
+        never clears already-valid state for other environments still mid-action.
 
         Args:
             env_ids: Indices of environments being reset, or None for all.
         """
-        # Reset target initialization flag so targets are recomputed from new pose
-        self._targets_initialized = False
-
-        # Reset settling timers for the specified environments
         if env_ids is None:
-            # Reset all environments
             self.time_in_threshold.zero_()
+            self._targets_initialized_mask.zero_()
+            self._interp_initialized_mask.zero_()
         else:
-            # Reset specific environments
             self.time_in_threshold[env_ids] = 0.0
-
-        # If targets were originally None, restore them to None
-        # This ensures they'll be re-filled from the new robot pose after reset
-        if self._position_was_none:
-            self.target_positions_w = None
-
-        if self._orientation_was_none:
-            self.target_orientations_w = None
-
-        self._interp_start_positions_w = None
-        self._interp_start_orientations_w = None
+            self._targets_initialized_mask[env_ids] = False
+            self._interp_initialized_mask[env_ids] = False
 
     @classmethod
     def from_cfg(cls, cfg: MoveToPoseCfg):
@@ -418,5 +486,8 @@ class MoveToPose(PrimitiveAction):
             orientation_threshold=cfg.orientation_threshold,
             settling_time=cfg.settling_time,
             interpolation_duration=cfg.interpolation_duration,
+            target_velocity=cfg.target_velocity,
+            min_interp_duration=cfg.min_interp_duration,
+            max_interp_duration=cfg.max_interp_duration,
             action_space_info=cfg.action_space_info,
         )

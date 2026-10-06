@@ -4,9 +4,9 @@
 name: smolvla
 
 kwargs:
-  # lerobot/smolvla_base
-  # pretrained_name_or_path: lerobot/smolvla_base
-  pretrained_name_or_path: outputs/20260918_054719_smolvla_bc_pipette_liquid/ckpt_step030000
+  # 9D task checkpoint used to initialize 24D training. For evaluation, override
+  # this with the new 24D checkpoint produced by the training run.
+  pretrained_name_or_path: lerobot/smolvla_base
   chunk_size: 100             # null -> use SmolVLA default
   n_action_steps: 10
   use_rotation_6d: true      # raw data/env use xyz+quat(+gripper); model learns xyz+rot6(+gripper)

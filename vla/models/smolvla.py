@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Quaternion helpers — [w, x, y, z] convention, matching Isaac Lab / LeRobot.
 # Used for relative-action conversion when use_relative_actions=True.
-# State layout: [ee_pos(3), ee_quat(4), gripper(2)]
+# State starts with current [ee_pos(3), ee_quat(4), gripper(2)]; optional history follows.
 # Action layouts:
 #   8D: [pos(3), quat(4), gripper_open(1)]
 #   9D: [pos(3), quat(4), gripper_pos(2)]
@@ -156,30 +156,37 @@ def _same_hemisphere(q: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     return torch.where(dot < 0, -q, q)
 
 
-def _gripper_open_from_state(state: torch.Tensor) -> torch.Tensor:
-    """Convert two observed finger positions to a single [0, 1] opening."""
-    grip = state[..., -2:] if state.shape[-1] >= 2 else state[..., -1:]
-    if grip.shape[-1] == 1:
-        return grip.clamp(0.0, 1.0)
+def _current_compact_state(state: torch.Tensor) -> torch.Tensor:
+    """Extract current 9D EE state from compact or position-history layouts."""
+    state_dim = int(state.shape[-1])
+    if state_dim < 9 or (state_dim - 9) % 3 != 0:
+        raise ValueError(
+            "State must start with current 9D [ee_pos(3), ee_quat(4), gripper_pos(2)] "
+            "and may append 3D historical positions, "
+            f"got shape {tuple(state.shape)}"
+        )
+    return state[..., :9]
+
+
+def _gripper_open_from_state(compact_state: torch.Tensor) -> torch.Tensor:
+    """Convert current two-finger positions to a single [0, 1] opening."""
+    grip = compact_state[..., 7:9]
     return grip.abs().clamp(0.0, 0.04).mean(dim=-1, keepdim=True) / 0.04
 
 
 def _state_to_action_pose(state: torch.Tensor) -> torch.Tensor:
     """Return current EE pose in the 8D base-frame action layout.
 
-    State layout:
-      [ee_pos(3), ee_quat(4), gripper_pos(2)]
-
-    The robot base is fixed for the current tasks, so the stored EE world pose
-    is already in the action frame.
+    The current compact state is always the first 9 dimensions. Position
+    history, when enabled, is appended and is not part of the action anchor.
     """
-    if state.shape[-1] != 9:
-        raise ValueError(
-            "State must be compact 9D [ee_pos(3), ee_quat(4), gripper_pos(2)], "
-            f"got shape {tuple(state.shape)}"
-        )
+    current = _current_compact_state(state)
     return torch.cat(
-        [state[..., :3], _quat_normalize(state[..., 3:7]), _gripper_open_from_state(state)],
+        [
+            current[..., :3],
+            _quat_normalize(current[..., 3:7]),
+            _gripper_open_from_state(current),
+        ],
         dim=-1,
     )
 
@@ -192,7 +199,7 @@ def actions_to_relative(actions: torch.Tensor, state: torch.Tensor) -> torch.Ten
 
     args:
         actions: (B, T, 8/9) or (B, 8/9) — [pos(3), quat(4), gripper...]
-        state:   (B, 9)               — [pos(3), quat(4), gripper(2)]
+        state:   (B, D)               — current compact 9D + optional position history
 
     returns: same shape as *actions*
         [pos_delta(3), quat_rel(4), gripper_abs(...)]
@@ -227,7 +234,7 @@ def actions_to_absolute(actions: torch.Tensor, state: torch.Tensor) -> torch.Ten
 
     args:
         actions: (B, T, 8/9) or (B, 8/9) — [pos_delta(3), quat_rel(4), gripper...]
-        state:   (B, 9)               — [pos(3), quat(4), gripper(2)]
+        state:   (B, D)               — current compact 9D + optional position history
 
     returns: same shape as *actions*, base-frame
     """
@@ -471,7 +478,7 @@ class SmolVLA(BaseVLA):
             if self._rel_step_in_chunk == 0:
                 # Capture state at the start of each planning chunk so all
                 # actions in the chunk are converted relative to the same origin.
-                self._rel_base_state = current_state.clone()
+                self._rel_base_state = _current_compact_state(current_state).clone()
 
         observation: dict[str, Any] = {
             "observation.state": current_state,

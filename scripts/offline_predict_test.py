@@ -149,18 +149,19 @@ def _validate_action_contract(action_dim: int, state_dim: int) -> None:
             f"[ee_pos(3), ee_quat(4), gripper...], got action_dim={action_dim}. "
             "Use a compatible dataset/checkpoint pair before running this test."
         )
-    if state_dim != 9:
+    if state_dim < 9 or (state_dim - 9) % 3 != 0:
         raise ValueError(
-            "offline_predict_test expects compact 9D observation.state "
-            "[ee_pos(3), ee_quat(4), gripper_pos(2)], "
-            f"got state_dim={state_dim}."
+            "offline_predict_test expects current compact 9D state with optional "
+            f"appended 3D historical positions, got state_dim={state_dim}."
         )
 
 
 def _state_mode_label(state_dim: int) -> str:
     if state_dim == 9:
         return "9D state [ee_pos(3), ee_quat(4), gripper_pos(2)]"
-    return f"{state_dim}D state"
+    if state_dim == 24:
+        return "24D state [state9[t], pos[t-4], pos[t-8], pos[t-12], pos[t-16], pos[t-20]]"
+    return f"{state_dim}D state with appended position history"
 
 
 def _action_mode_label(action_dim: int) -> str:

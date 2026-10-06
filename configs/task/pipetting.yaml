@@ -13,6 +13,8 @@ adapter:
     - articulations/robot__ee_base_pos      # (3,)
     - articulations/robot__ee_base_quat     # (4,)
     - articulations/robot__gripper_pos      # (2,)
+  # Model state: [state9[t], pos[t-4], pos[t-8], pos[t-12], pos[t-16], pos[t-20]] (24D).
+  position_history_offsets: [4, 8, 12, 16, 20]
   image_size: [224, 224]
 
 # Language template configuration for synthetic data generation.

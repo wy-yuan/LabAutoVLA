@@ -44,8 +44,11 @@ class PipetteLiquidCfg(PickingPipetteCfg):
                     object=self.source,
                     frame="liquid_approach",
                     agent_assets=self.agent_assets,
-                    interpolation_duration=self.interpolation_duration,
+                    interpolation_duration=self.interpolation_duration+0.8,
                     action_space_info=self.action_space_info,
+                    position_threshold=self.grasp_position_threshold,
+                    target_velocity=self.transit_target_velocity,
+                    settling_time=self.settling_time,
                 ),
                 MoveRelativeCfg(
                     agent_assets=self.agent_assets,
@@ -53,6 +56,8 @@ class PipetteLiquidCfg(PickingPipetteCfg):
                     orientation_offset=None,
                     interpolation_duration=self.interpolation_duration,
                     action_space_info=self.action_space_info,
+                    target_velocity=self.vertical_target_velocity,
+                    settling_time=self.settling_time,
                 ),
                 MoveRelativeCfg(
                     agent_assets=self.agent_assets,
@@ -60,13 +65,18 @@ class PipetteLiquidCfg(PickingPipetteCfg):
                     orientation_offset=None,
                     interpolation_duration=self.interpolation_duration,
                     action_space_info=self.action_space_info,
+                    target_velocity=self.vertical_target_velocity,
+                    settling_time=self.settling_time,
                 ),
                 MoveToFrameCfg(
                     object=self.target,
                     frame="liquid_approach",
                     agent_assets=self.agent_assets,
-                    interpolation_duration=self.interpolation_duration,
+                    interpolation_duration=self.interpolation_duration+0.5,
                     action_space_info=self.action_space_info,
+                    position_threshold=self.grasp_position_threshold,
+                    target_velocity=self.transit_target_velocity,
+                    settling_time=self.settling_time,
                 ),
                 MoveRelativeCfg(
                     agent_assets=self.agent_assets,
@@ -74,6 +84,8 @@ class PipetteLiquidCfg(PickingPipetteCfg):
                     orientation_offset=None,
                     interpolation_duration=self.interpolation_duration,
                     action_space_info=self.action_space_info,
+                    target_velocity=self.vertical_target_velocity,
+                    settling_time=self.settling_time,
                 ),
                 MoveRelativeCfg(
                     agent_assets=self.agent_assets,
@@ -81,6 +93,8 @@ class PipetteLiquidCfg(PickingPipetteCfg):
                     orientation_offset=None,
                     interpolation_duration=self.interpolation_duration,
                     action_space_info=self.action_space_info,
+                    target_velocity=self.vertical_target_velocity,
+                    settling_time=self.settling_time,
                 ),
             ]
         )

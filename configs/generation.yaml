@@ -26,8 +26,13 @@ defaults:
 
 # Pipeline stage controls
 stages:
-  collect_hdf5: true                 # Collect raw demos into HDF5 files
-  convert_lerobot: true              # Convert collected HDF5 files to LeRobot v3.0
+  collect_hdf5: true                 # Collect new raw demos; set false to reuse conversion.source_hdf5_paths
+  convert_lerobot: true              # Convert HDF5 files to a materialized 24D LeRobot dataset
+
+# Convert-only input paths can differ from the new LeRobot output name.
+conversion:
+  source_hdf5_paths:
+    pipetting: data/datasets/hdf5/pipetting_v10_action_vel_settling_ep200/pipetting.hdf5
 
 # Generation parameters
 generation:
@@ -73,10 +78,10 @@ domain_randomization:
 # Output settings
 output:
   root: "data/datasets"               # Root output directory
-  dataset_name: pipetting_v3_ep200_envs10   # Optional explicit dataset name override
+  dataset_name: pipetting_v10_action_vel_settling_hist24_ep200
   hdf5_subdir: "hdf5"                 # Subdirectory under root for collected HDF5 files
   overwrite_hdf5: false               # Replace existing HDF5 files if they already exist
-  overwrite_lerobot: false            # Replace existing LeRobot dataset output if it already exists
+  overwrite_lerobot: false            # Set true only to rebuild this new hist24 destination
   repo_id: null                       # Optional LeRobot repo_id override (defaults to local/<dataset_name>)
   format: "lerobot"                   # Output format (only "lerobot" supported)
   fps: 60                             # Frames per second (metadata)

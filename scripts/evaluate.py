@@ -118,11 +118,10 @@ def _build_policy(cfg: DictConfig, obs: dict[str, Any], action_dim: int):
         )
 
     log = logging.getLogger(__name__)
-    if state_dim != 9:
+    if state_dim < 9 or (state_dim - 9) % 3 != 0:
         raise ValueError(
-            "Expected compact 9D evaluation state "
-            "[ee_pos(3), ee_quat(4), gripper_pos(2)], "
-            f"but adapter produced state_dim={state_dim}."
+            "Evaluation state must start with current compact 9D state and may append "
+            f"3D historical positions, but adapter produced state_dim={state_dim}."
         )
     log.info(
         "Building VLA model name=%s state_dim=%d raw_action_dim=%d model_action_dim=%d image_keys=%s",

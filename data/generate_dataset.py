@@ -232,6 +232,9 @@ def _adapter_cfg_from_task_spec(task_spec: TaskSpec) -> ObsAdapterConfig:
     image_keys = dict(adapter_dict.get("image_keys", default_cfg.image_keys))
     state_keys = list(adapter_dict.get("state_keys", default_cfg.state_keys))
     image_size = tuple(adapter_dict.get("image_size", default_cfg.image_size))
+    position_history_offsets = tuple(
+        adapter_dict.get("position_history_offsets", default_cfg.position_history_offsets)
+    )
 
     if len(image_size) != 2:
         raise ValueError(f"Task {task_spec.alias} adapter.image_size must be [height, width].")
@@ -242,6 +245,7 @@ def _adapter_cfg_from_task_spec(task_spec: TaskSpec) -> ObsAdapterConfig:
         image_keys=image_keys,
         state_keys=state_keys,
         image_size=(int(image_size[0]), int(image_size[1])),
+        position_history_offsets=position_history_offsets,
     )
 
 
@@ -630,6 +634,32 @@ def collect_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> dict[str, in
     return episodes_collected
 
 
+def resolve_conversion_hdf5_paths(
+    cfg: DictConfig, layout: OutputLayout
+) -> dict[str, Path]:
+    """Resolve optional existing HDF5 inputs independently of output dataset name."""
+    # A collect+convert run must consume the HDF5 files it just wrote. Explicit
+    # source overrides are only for convert-only runs that reuse prior demos.
+    if bool(cfg.stages.get("collect_hdf5", False)):
+        return dict(layout.hdf5_paths)
+    conversion_cfg = cfg.get("conversion", {})
+    overrides = conversion_cfg.get("source_hdf5_paths") if conversion_cfg else None
+    if not overrides:
+        return dict(layout.hdf5_paths)
+
+    resolved: dict[str, Path] = {}
+    for task_alias in cfg.generation.tasks:
+        if task_alias not in overrides:
+            raise KeyError(
+                f"conversion.source_hdf5_paths is missing task '{task_alias}'"
+            )
+        path = Path(str(overrides[task_alias]))
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        resolved[str(task_alias)] = path
+    return resolved
+
+
 def write_generation_metadata(
     layout: OutputLayout,
     cfg: DictConfig,
@@ -641,9 +671,12 @@ def write_generation_metadata(
 
     task_specs = resolve_task_specs(cfg, cfg.generation.tasks)
     adapter_cfg = resolve_adapter_cfg(cfg)
+    conversion_hdf5_paths = resolve_conversion_hdf5_paths(cfg, layout)
     metadata = {
         "dataset_name": layout.dataset_name,
-        "hdf5_paths": {task_alias: str(path) for task_alias, path in layout.hdf5_paths.items()},
+        "hdf5_paths": {
+            task_alias: str(path) for task_alias, path in conversion_hdf5_paths.items()
+        },
         "lerobot_dir": str(layout.lerobot_dir),
         "episodes_collected": episodes_collected or {},
         "stages": OmegaConf.to_container(cfg.stages, resolve=True),
@@ -659,6 +692,7 @@ def write_generation_metadata(
             "image_keys": adapter_cfg.image_keys,
             "state_keys": adapter_cfg.state_keys,
             "image_size": list(adapter_cfg.image_size),
+            "position_history_offsets": list(adapter_cfg.position_history_offsets),
         },
     }
 
@@ -668,7 +702,8 @@ def write_generation_metadata(
 
 def convert_hdf5_datasets(cfg: DictConfig, layout: OutputLayout) -> Path:
     """Convert collected HDF5 files into a LeRobot dataset."""
-    src_paths = [layout.hdf5_paths[task_id] for task_id in cfg.generation.tasks]
+    resolved_hdf5_paths = resolve_conversion_hdf5_paths(cfg, layout)
+    src_paths = [resolved_hdf5_paths[task_alias] for task_alias in cfg.generation.tasks]
     missing_paths = [path for path in src_paths if not path.exists()]
     if missing_paths:
         missing_str = ", ".join(str(path) for path in missing_paths)

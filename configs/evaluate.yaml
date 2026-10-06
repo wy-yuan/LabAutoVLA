@@ -17,11 +17,13 @@ device: "cuda:0"
 
 eval:
   n_episodes: 1
-  max_steps: 1200
+  max_steps: 1300
 
 dataset:
-  root: data/datasets/pipetting_v6_action_hold05_ep200
-  repo_id: local/pipetting_v6_action_hold05_ep200
+  # root: data/datasets/pipetting_v6_action_hold_ep50
+  # repo_id: local/pipetting_v6_action_hold_ep50
+  root: data/datasets/pipetting_v10_action_vel_settling_hist24_ep200
+  repo_id: local/pipetting_v10_action_vel_settling_hist24_ep200
   fps: 60
   action_chunk_size: 100
   stats_batch_size: 256

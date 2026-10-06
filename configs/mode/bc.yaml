@@ -3,7 +3,7 @@ name: bc
 
 device: "cuda:0" 
 steps: 20000
-batch_size: 12
+batch_size: 16
 num_workers: 4
 validation_fraction: 0.1
 split_seed: 42

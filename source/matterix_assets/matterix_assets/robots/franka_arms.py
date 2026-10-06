@@ -125,7 +125,7 @@ class FRANKA_ROBOTI2F85_INST_CFG(MatterixArticulationCfg):
             mode="reset",
             params={
                 "mean": 0.0,
-                "std": 0.02,
+                "std": 0.0,
             },
         ),
     }
@@ -259,7 +259,7 @@ class FRANKA_PANDA_CFG(MatterixArticulationCfg):
             mode="reset",
             params={
                 "mean": 0.0,
-                "std": 0.05,
+                "std": 0.0,
             },
         ),
     }

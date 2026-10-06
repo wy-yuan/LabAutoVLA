@@ -15,7 +15,11 @@ import h5py
 import numpy as np
 import torch
 
-from vla.data.obs_adapter import ObsAdapterConfig, build_vla_inputs
+from vla.data.obs_adapter import (
+    ObsAdapterConfig,
+    augment_state_sequence_with_position_history,
+    build_vla_inputs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +105,35 @@ def _h5_group_to_frame_slice_tensor_dict(
             array = np.asarray(value[start:stop] if value.ndim >= 1 else value)
             out[key] = torch.from_numpy(array)
     return out
+
+
+def _read_compact_state_sequence(
+    obs_group: h5py.Group,
+    adapter_cfg: ObsAdapterConfig,
+    num_steps: int,
+) -> torch.Tensor:
+    """Read only configured proprioception channels for one full episode."""
+    parts: list[torch.Tensor] = []
+    for path in adapter_cfg.state_keys:
+        if path not in obs_group:
+            raise KeyError(f"HDF5 observation path is missing: {path}")
+        dataset = obs_group[path]
+        if not isinstance(dataset, h5py.Dataset):
+            raise TypeError(f"HDF5 observation path is not a dataset: {path}")
+        value = torch.from_numpy(np.asarray(dataset[:num_steps]))
+        parts.append(value if value.ndim == 2 else value.unsqueeze(-1))
+    return torch.cat(parts, dim=-1).float()
+
+
+def _episode_model_states(
+    obs_group: h5py.Group,
+    adapter_cfg: ObsAdapterConfig,
+    num_steps: int,
+) -> torch.Tensor:
+    compact_states = _read_compact_state_sequence(obs_group, adapter_cfg, num_steps)
+    return augment_state_sequence_with_position_history(
+        compact_states, adapter_cfg.position_history_offsets
+    )
 
 
 def _demo_ref_from_group(
@@ -291,7 +324,10 @@ def _create_dataset(
         task=first_demo.task,
         num_envs=first_demo.actions.shape[0],
     )
-    state_dim = int(sample_inputs["state"].shape[-1])
+    sample_states = augment_state_sequence_with_position_history(
+        sample_inputs["state"].float(), adapter_cfg.position_history_offsets
+    )
+    state_dim = int(sample_states.shape[-1])
     action_dim = int(first_demo.actions.shape[-1])
     image_shapes = {key: tuple(value.shape[1:]) for key, value in sample_inputs["images"].items()}
 
@@ -340,7 +376,10 @@ def _create_dataset_from_hdf5_group(
 
     sample_obs = _h5_group_to_frame_tensor_dict(first_demo_group["obs"], 0)
     sample_inputs = build_vla_inputs(sample_obs, adapter_cfg, task=first_demo.task, num_envs=1)
-    state_dim = int(sample_inputs["state"].shape[-1])
+    sample_states = augment_state_sequence_with_position_history(
+        sample_inputs["state"].float(), adapter_cfg.position_history_offsets
+    )
+    state_dim = int(sample_states.shape[-1])
     action_dim = int(first_demo_group["actions"].shape[-1])
     image_shapes = {key: tuple(value.shape[1:]) for key, value in sample_inputs["images"].items()}
 
@@ -373,6 +412,11 @@ def _add_hdf5_demo_to_dataset(
     frames_per_chunk: int,
 ) -> None:
     """Stream one HDF5 demo into an open LeRobot dataset."""
+    # Proprioception is tiny compared with RGB. Read it once per episode so
+    # history indices remain correct across image streaming chunk boundaries.
+    episode_states = _episode_model_states(
+        demo_group["obs"], adapter_cfg, demo.num_steps
+    )
     for start in range(0, demo.num_steps, frames_per_chunk):
         stop = min(start + frames_per_chunk, demo.num_steps)
         chunk_len = stop - start
@@ -381,7 +425,7 @@ def _add_hdf5_demo_to_dataset(
         actions_chunk = torch.from_numpy(np.asarray(demo_group["actions"][start:stop])).float()
         inputs = build_vla_inputs(obs_chunk, adapter_cfg, task=demo.task, num_envs=chunk_len)
 
-        states = inputs["state"].float().cpu().numpy()
+        states = episode_states[start:stop].cpu().numpy()
         actions = actions_chunk.cpu().numpy()
         images = {
             image_key: (image.clamp(0, 1) * 255.0)

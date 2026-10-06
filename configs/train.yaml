@@ -15,9 +15,9 @@ defaults:
 
 # Default dataset location for pipetting training.
 dataset:
-  src_hdf5: data/datasets/hdf5/pipetting_v6_action_hold05_ep200/pipetting.hdf5
-  root: data/datasets/pipetting_v6_action_hold05_ep200
-  repo_id: local/pipetting_v6_action_hold05_ep200
+  src_hdf5: data/datasets/hdf5/pipetting_v11_action_vel01_012_018_24D_ep300/pipetting.hdf5
+  root: data/datasets/pipetting_v11_action_vel01_012_018_24D_ep300
+  repo_id: local/pipetting_v11_action_vel01_012_018_24D_ep300
   fps: 60
   action_chunk_size: 100
 

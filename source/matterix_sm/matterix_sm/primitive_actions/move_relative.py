@@ -54,6 +54,9 @@ class MoveRelative(MoveToPose):
         position_threshold: float = None,
         orientation_threshold: float = None,
         interpolation_duration: float = 0.0,
+        target_velocity: float | None = None,
+        min_interp_duration: float = 0.1,
+        max_interp_duration: float = 5.0,
         action_space_info: ActionSpaceInfo | None = None,
     ):
         """
@@ -67,6 +70,11 @@ class MoveRelative(MoveToPose):
             position_threshold: Distance threshold for success (meters).
             orientation_threshold: Orientation threshold for success (radians).
             interpolation_duration: Time in seconds to ramp the commanded pose from current to target.
+                                   Ignored when target_velocity is set.
+            target_velocity: Optional constant end-effector speed (m/s) used to derive
+                            interpolation_duration from the offset magnitude at runtime.
+            min_interp_duration: Lower bound (seconds) for the derived duration.
+            max_interp_duration: Upper bound (seconds) for the derived duration.
             action_space_info: Optional action space metadata for mask creation.
         """
         # Initialize parent with None for targets (will be set on first call)
@@ -78,6 +86,9 @@ class MoveRelative(MoveToPose):
             position_threshold=position_threshold,
             orientation_threshold=orientation_threshold,
             interpolation_duration=interpolation_duration,
+            target_velocity=target_velocity,
+            min_interp_duration=min_interp_duration,
+            max_interp_duration=max_interp_duration,
             action_space_info=action_space_info,
         )
 
@@ -97,7 +108,6 @@ class MoveRelative(MoveToPose):
         # These will be set in set_execution_params()
         self.position_offset = None
         self.orientation_offset = None
-        self._target_initialized = False
 
     def set_execution_params(self, num_envs: int, device: str | torch.device, dt: float) -> None:
         """Set execution parameters and initialize offset tensors."""
@@ -110,11 +120,16 @@ class MoveRelative(MoveToPose):
     def _compute_action_impl(self, scene_data: SceneData, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute relative move action for controlled asset.
 
-        On first call, computes target pose as:
+        For envs newly entering this action, computes target pose as:
         - target_position = current_position + position_offset
         - target_orientation = current_orientation * orientation_offset (quaternion multiplication)
+        using THEIR OWN current pose. Already-initialized envs (per _targets_initialized_mask,
+        shared with the base class) keep their cached target.
 
-        Subsequent calls use the cached target (same as MoveToPose).
+        Environments advance through the action sequence independently (see
+        StateMachine.step()), so this resolves the target per env_ids rather than using a
+        single shared flag -- otherwise whichever env reaches this action first would fix
+        the offset target for every env, including ones still mid-motion on a prior action.
 
         Args:
             scene_data: Complete scene state container.
@@ -125,8 +140,8 @@ class MoveRelative(MoveToPose):
                 - action_tensor: Shape (num_envs, action_dim) - action values for all envs
                 - action_dim_mask: Shape (action_dim,) - which dimensions this action controls
         """
-        # On first call, compute target pose relative to current EE pose
-        if not self._target_initialized:
+        newly_initialized = env_ids[~self._targets_initialized_mask[env_ids]]
+        if newly_initialized.numel() > 0:
             # Get robot articulation data
             if self._asset_name not in scene_data.articulations:
                 raise ValueError(
@@ -141,32 +156,27 @@ class MoveRelative(MoveToPose):
             if robot_data.ee_quat_w is None:
                 raise ValueError(f"End-effector orientation not available for asset '{self._asset_name}'")
 
-            # Get current EE pose
-            current_pos = robot_data.ee_pos_w.to(self.device)
-            current_quat = robot_data.ee_quat_w.to(self.device)
+            # Get current EE pose (only for the newly-activated envs)
+            current_pos = robot_data.ee_pos_w[newly_initialized].to(self.device)
+            current_quat = robot_data.ee_quat_w[newly_initialized].to(self.device)
 
             # Compute target position: current + offset (world frame)
             # Position offset is interpreted in world coordinates - direct vector addition
             # Example: position_offset=(0.1, 0, 0) moves 0.1m along world X-axis
-            self.target_positions_w = current_pos + self.position_offset.unsqueeze(0)
+            self.target_positions_w[newly_initialized] = current_pos + self.position_offset.unsqueeze(0)
 
             # Compute target orientation: current * offset (local/body frame)
             # Quaternion multiplication applies rotation relative to current orientation
             # Example: 90° pitch offset rotates gripper 90° around its current pitch axis
-            # Broadcast orientation offset to all environments
-            orientation_offset_broadcast = self.orientation_offset.unsqueeze(0).expand(self.num_envs, -1)
-            self.target_orientations_w = quat_mul(current_quat, orientation_offset_broadcast)
+            orientation_offset_broadcast = self.orientation_offset.unsqueeze(0).expand(newly_initialized.numel(), -1)
+            self.target_orientations_w[newly_initialized] = quat_mul(current_quat, orientation_offset_broadcast)
 
-            self._target_initialized = True
+            # Shared with the base class: marks these envs as fully targeted so
+            # MoveToPose._compute_action_impl's own (generic) fallback-fill skips them.
+            self._targets_initialized_mask[newly_initialized] = True
 
         # Delegate to parent's implementation
         return super()._compute_action_impl(scene_data, env_ids)
-
-    def _reset_impl(self, env_ids: torch.Tensor | None = None) -> None:
-        """Reset target initialization flag when environments are reset."""
-        super()._reset_impl(env_ids)
-        # Target needs to be recomputed relative to new EE pose after reset
-        self._target_initialized = False
 
     @classmethod
     def from_cfg(cls, cfg: MoveRelativeCfg):
@@ -179,5 +189,8 @@ class MoveRelative(MoveToPose):
             position_threshold=cfg.position_threshold,
             orientation_threshold=cfg.orientation_threshold,
             interpolation_duration=cfg.interpolation_duration,
+            target_velocity=cfg.target_velocity,
+            min_interp_duration=cfg.min_interp_duration,
+            max_interp_duration=cfg.max_interp_duration,
             action_space_info=cfg.action_space_info,
         )

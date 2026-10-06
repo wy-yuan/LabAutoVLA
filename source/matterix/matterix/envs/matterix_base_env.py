@@ -475,17 +475,22 @@ class MatterixBaseEnv(ManagerBasedEnv, gym.Env):
         self.episode_length_buf[env_ids] = 0
 
     def _refresh_rtx_sensors_after_reset(self) -> None:
-        """Advance reset state into RTX sensor buffers before observations are read."""
-        if not self.sim.has_rtx_sensors():
+        """Refresh RTX sensors and flush temporal render history after reset."""
+        num_rerenders = max(0, int(self.cfg.num_rerenders_on_reset))
+        if not self.sim.has_rtx_sensors() or num_rerenders == 0:
             return
 
-        for _ in range(self.cfg.num_rerenders_on_reset):
-            # A render-only update leaves TiledCamera on the previous frame after
-            # articulation joints are teleported during reset. One simulation tick
-            # propagates the new link transforms through PhysX/Fabric into RTX.
-            self.sim.step(render=True)
-            self._sim_step_counter += 1
-            self.scene.update(dt=self.physics_dt)
+        # A render-only update leaves TiledCamera on the previous frame after
+        # articulation joints are teleported during reset. Advance physics once
+        # to propagate the new transforms through PhysX/Fabric into RTX.
+        self.sim.step(render=True)
+        self._sim_step_counter += 1
+        self.scene.update(dt=self.physics_dt)
+
+        # Additional render-only passes clear temporal reconstruction history
+        # (for example DLSS ghosting) without advancing robot or particle state.
+        for _ in range(num_rerenders - 1):
+            self.sim.render()
 
     def reset(
         self,
