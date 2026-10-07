@@ -1,0 +1,14 @@
+defaults:
+  - evaluate
+  - _self_
+
+handoff:
+  # Completed stage: reset, pre_grasp, open_gripper, grasp, close_gripper,
+  # picking, source_approach, source_dip, source, target_approach, target_dip, target.
+  after_stage: picking
+  # Optional zero-based primitive index. Overrides after_stage when provided.
+  after_action: null
+  # Separate budget for the scripted prefix; eval.max_steps is policy-only.
+  max_steps: 1000
+
+output_dir: outputs/${now:%Y%m%d_%H%M%S}_${model.name}_eval_staged
