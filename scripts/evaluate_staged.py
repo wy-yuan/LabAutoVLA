@@ -40,6 +40,8 @@ def main(cfg: DictConfig) -> None:
     log = logging.getLogger(__name__)
     if cfg.eval.n_episodes <= 0 or cfg.eval.max_steps <= 0 or cfg.handoff.max_steps < 0:
         raise ValueError("Episode/policy budgets must be positive; scripted budget must be nonnegative")
+    if int(cfg.eval.get("num_envs", 1)) != 1:
+        raise ValueError("Staged evaluation currently requires eval.num_envs=1")
     output_dir = Path(cfg.output_dir)
     video_dir = output_dir / "eval_videos"
     video_dir.mkdir(parents=True, exist_ok=True)

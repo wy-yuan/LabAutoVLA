@@ -62,15 +62,19 @@ class VLAEnvWrapper(gym.Wrapper):
         return self._adapt(obs), reward, terminated, truncated, info
 
     def render(self, mode: str = "rgb_array") -> np.ndarray | None:
-        """Grab an RGB frame from the scene camera, no matter what gym mode asks."""
+        """Return env 0's RGB frame for single-episode/staged callers."""
+        frames = self.render_all(mode=mode)
+        return None if frames is None else frames[0]
+
+    def render_all(self, mode: str = "rgb_array") -> np.ndarray | None:
+        """Return batched RGB frames as ``(num_envs, H, W, 3)`` uint8."""
         if self.render_camera_key not in self.env.unwrapped.scene.keys():
             return None
         cam = self.env.unwrapped.scene[self.render_camera_key]
         rgb = cam.data.output["rgb"][..., :3]  # (N, H, W, 3)
         if rgb.dtype.is_floating_point:
             rgb = (rgb.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
-        # Return env 0 by default — evaluator handles multi-env stitching.
-        return rgb[0].detach().cpu().numpy()
+        return rgb.detach().cpu().numpy()
 
     # ------------------------------------------------------------------
     # Internals

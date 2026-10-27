@@ -15,7 +15,7 @@ Evaluate the default pretrained SmolVLA on the default pipetting task:
     python scripts/evaluate.py
 
 Override rollout length or episode count:
-    python scripts/evaluate.py eval.n_episodes=3 eval.max_steps=300
+    python scripts/evaluate.py eval.n_episodes=8 eval.num_envs=4 eval.max_steps=300
 
 Evaluate another model/task config:
     python scripts/evaluate.py model=smolvla task=pipetting
@@ -81,10 +81,18 @@ def _build_env(cfg: DictConfig):
     from vla.envs.vla_env_wrapper import VLAEnvWrapper
 
     adapter_cfg = ObsAdapterConfig(**OmegaConf.to_container(cfg.task.adapter, resolve=True))
-    env_cfg = parse_env_cfg(cfg.task.id, device=cfg.device, num_envs=1)
+    num_envs = int(cfg.eval.get("num_envs", 1))
+    if num_envs <= 0:
+        raise ValueError(f"eval.num_envs must be positive, got {num_envs}")
+    env_cfg = parse_env_cfg(cfg.task.id, device=cfg.device, num_envs=num_envs)
 
     log = logging.getLogger(__name__)
-    log.info("Building evaluator env id=%s device=%s num_envs=1", cfg.task.id, cfg.device)
+    log.info(
+        "Building evaluator env id=%s device=%s num_envs=%d",
+        cfg.task.id,
+        cfg.device,
+        num_envs,
+    )
     env = gym.make(cfg.task.id, cfg=env_cfg).unwrapped
     return VLAEnvWrapper(env, adapter_cfg=adapter_cfg, task_prompt=cfg.task.prompt)
 

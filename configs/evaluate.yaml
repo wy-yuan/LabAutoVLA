@@ -5,7 +5,7 @@
 #   python scripts/evaluate.py
 #
 # Override rollout length or episode count:
-#   python scripts/evaluate.py eval.n_episodes=3 eval.max_steps=300
+#   python scripts/evaluate.py eval.n_episodes=8 eval.num_envs=4 eval.max_steps=300
 # =============================================================================
 
 defaults:
@@ -16,7 +16,8 @@ defaults:
 device: "cuda:0"
 
 eval:
-  n_episodes: 1
+  n_episodes: 20
+  num_envs: 5
   max_steps: 1300
 
 dataset:

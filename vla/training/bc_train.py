@@ -748,7 +748,12 @@ class _LazyEvaluator:
         from vla.envs.vla_env_wrapper import VLAEnvWrapper
         from vla.training.evaluator import RolloutEvaluator
 
-        env_cfg = parse_env_cfg(self.cfg.task.id, device=self.cfg.mode.device, num_envs=1)
+        eval_num_envs = int(self.cfg.mode.eval.get("num_envs", 1))
+        env_cfg = parse_env_cfg(
+            self.cfg.task.id,
+            device=self.cfg.mode.device,
+            num_envs=eval_num_envs,
+        )
         # if not self.cfg.mode.eval.get("use_async_envs", True):
         #     env_cfg.use_async_envs = False
         spec = gym.spec(self.cfg.task.id)
@@ -836,7 +841,12 @@ def _build_evaluator(cfg: DictConfig, adapter_cfg: ObsAdapterConfig):
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
     from vla.envs.vla_env_wrapper import VLAEnvWrapper
 
-    env_cfg = parse_env_cfg(cfg.task.id, device=cfg.mode.device, num_envs=1)
+    eval_num_envs = int(cfg.mode.eval.get("num_envs", 1))
+    env_cfg = parse_env_cfg(
+        cfg.task.id,
+        device=cfg.mode.device,
+        num_envs=eval_num_envs,
+    )
     spec = gym.spec(cfg.task.id)
     log.info(
         "Building evaluator env id=%s entry_point=%s kwargs=%s device=%s num_envs=%s",

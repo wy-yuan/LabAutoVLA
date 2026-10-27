@@ -26,6 +26,7 @@ kl_to_bc: 0.05
 sim_eval: true
 eval:
   n_episodes: 5
+  num_envs: 1
   max_steps: 500
 
 use_wandb: false

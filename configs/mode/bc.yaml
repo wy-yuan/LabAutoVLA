@@ -17,6 +17,7 @@ eval_every: 5000
 sim_eval: false
 eval:
   n_episodes: 1
+  num_envs: 1
   max_steps: 500
   use_async_envs: false
 
